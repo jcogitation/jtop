@@ -4,11 +4,16 @@ use crossterm::{
     event::{self, Event, KeyCode},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     fs,
     io::{self, Write},
     time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc,
+    },
+    thread,
 };
 
 // ── Terminal Guard: guarantees cleanup on exit, panic, or signal ──────
@@ -165,82 +170,8 @@ struct ProcInfo {
     uss_kb: u64,
     rss_kb: u64,
     swap_kb: u64,
-    utime: u64,
-    stime: u64,
     state: char,
     cpu_percent: f64,
-}
-
-fn read_process_info(pid: i32, user_map: &UserMap) -> Option<ProcInfo> {
-    let mut pss_kb = 0u64; let mut rss_kb = 0u64;
-    let mut private_clean = 0u64; let mut private_dirty = 0u64; let mut swap_kb = 0u64;
-    if let Ok(content) = fs::read_to_string(format!("/proc/{}/smaps_rollup", pid)) {
-        for line in content.lines() {
-            let mut parts = line.split_whitespace();
-            match parts.next() {
-                Some("Pss:")           => pss_kb = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
-                Some("Rss:")           => rss_kb = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
-                Some("Private_Clean:") => private_clean = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
-                Some("Private_Dirty:") => private_dirty = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
-                Some("Swap:")          => swap_kb = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
-                _ => {}
-            }
-        }
-    }
-    let uss_kb = private_clean + private_dirty;
-
-    let uid: u32 = fs::read_to_string(format!("/proc/{}/status", pid))
-        .ok()
-        .and_then(|s| s.lines()
-            .find(|l| l.starts_with("Uid:"))
-            .and_then(|l| l.split_whitespace().nth(1)?.parse().ok()))
-        .unwrap_or(0);
-    let user = user_map.get(&uid).cloned().unwrap_or_else(|| uid.to_string());
-
-    let mut utime = 0u64; let mut stime = 0u64; let mut state = '?';
-    if let Ok(content) = fs::read_to_string(format!("/proc/{}/stat", pid)) {
-        if let Some(rbracket) = content.rfind(')') {
-            let fields: Vec<&str> = content[rbracket+2..].split_whitespace().collect();
-            if fields.len() >= 13 {
-                state = fields[0].chars().next().unwrap_or('?');
-                utime = fields[11].parse().unwrap_or(0);
-                stime = fields[12].parse().unwrap_or(0);
-            }
-        }
-    }
-
-    let full_cmd = fs::read_to_string(format!("/proc/{}/cmdline", pid))
-        .unwrap_or_default()
-        .replace('\0', " ")
-        .trim()
-        .to_string();
-    let full_cmd = full_cmd.chars().take(2040).collect::<String>();
-    let cmd = full_cmd.chars().take(40).collect::<String>();
-
-    // FIX #1: Skip processes with 0 RSS (no resident memory = placeholder/zombie)
-    if rss_kb == 0 {
-        return None;
-    }
-
-    Some(ProcInfo { pid, user, cmd, full_cmd, pss_kb, uss_kb, rss_kb, swap_kb, utime, stime, state, cpu_percent: 0.0 })
-}
-
-fn get_process_list(user_map: &UserMap) -> Vec<ProcInfo> {
-    let mut procs = Vec::new();
-    if let Ok(dir) = fs::read_dir("/proc") {
-        for entry in dir.flatten() {
-            if let Some(pid_str) = entry.file_name().to_str() {
-                if pid_str.chars().all(|c| c.is_ascii_digit()) {
-                    if let Ok(pid) = pid_str.parse::<i32>() {
-                        if let Some(info) = read_process_info(pid, user_map) {
-                            procs.push(info);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    procs
 }
 
 fn sort_procs(procs: &mut Vec<ProcInfo>, col: usize, reverse: bool) {
@@ -302,19 +233,16 @@ fn color_cpu(percent: f64) -> (u8, u8, u8) {
 
 struct App {
     term_width: usize, term_height: usize, interval: f64, no_color: bool,
-    current_user: String, clk_tck: u64, num_cpus: u64,
+    current_user: String,
     mem_total_bytes: u64, limit_red_bytes: u64, swap_total_bytes: u64,
-    user_map: UserMap,
     raw_data: Vec<ProcInfo>, filtered_raw: Vec<ProcInfo>, data_rows: Vec<Vec<String>>,
     widths: Vec<usize>, sort_col: usize, sort_reverse: bool,
     filter_string: String, searching: bool, killing: bool, kill_pid_str: String, cmd_offset: usize,
-    previous_cpu_times: HashMap<i32, (u64, Instant)>,
-    prev_sys_cpu: Option<(u64, u64)>,
     system_info: SystemInfo,
-    scroll_pos: usize, last_refresh: Instant,
+    scroll_pos: usize, mem_override: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct SystemInfo {
     cpu_percent: f64, mem_percent: f64, swap_percent: f64,
     load: String, uptime: String, tasks: String,
@@ -327,86 +255,20 @@ impl App {
         let mem_total_bytes = *meminfo.get("MemTotal").unwrap_or(&(16*1024*1024)) * 1024;
         let swap_total_bytes = *meminfo.get("SwapTotal").unwrap_or(&(32*1024*1024)) * 1024;
         let limit_red_bytes = (mem_total_bytes as f64 * 0.99) as u64;
-        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-        let num_cpus = num_cpus::get() as u64;
         let current_user = env::var("SUDO_USER").ok()
             .or_else(|| env::var("USER").ok())
             .unwrap_or_default();
         Self {
             term_width: w as usize, term_height: h as usize,
-            interval, no_color, current_user, clk_tck, num_cpus,
+            interval, no_color, current_user,
             mem_total_bytes, limit_red_bytes, swap_total_bytes,
-            user_map: build_user_map(),
             raw_data: vec![], filtered_raw: vec![], data_rows: vec![],
             widths: vec![0;8], sort_col: 3, sort_reverse: true,
             filter_string: String::new(), searching: false, killing: false,
             kill_pid_str: String::new(), cmd_offset: 0,
-            previous_cpu_times: HashMap::new(), prev_sys_cpu: None,
             system_info: SystemInfo::default(), scroll_pos: 0,
-            last_refresh: Instant::now(),
+            mem_override: false,
         }
-    }
-
-    fn full_update(&mut self) {
-        self.raw_data = get_process_list(&self.user_map);
-        let now = Instant::now();
-        for proc in &mut self.raw_data {
-            let cur = proc.utime + proc.stime;
-            if let Some(&(prev, prev_time)) = self.previous_cpu_times.get(&proc.pid) {
-                let delta = cur.saturating_sub(prev);
-                let dt = now.duration_since(prev_time).as_secs_f64();
-                if dt > 0.0 {
-                    proc.cpu_percent = (delta as f64 / self.clk_tck as f64 / self.num_cpus as f64 / dt) * 100.0;
-                }
-            }
-            self.previous_cpu_times.insert(proc.pid, (cur, now));
-        }
-        self.previous_cpu_times.retain(|&pid,_| self.raw_data.iter().any(|p| p.pid==pid));
-
-        let (total, idle) = read_cpu_times();
-        let cpu_percent = if let Some((prev_total, prev_idle)) = self.prev_sys_cpu {
-            let d_total = total.saturating_sub(prev_total);
-            let d_idle = idle.saturating_sub(prev_idle);
-            if d_total > 0 { (1.0 - d_idle as f64 / d_total as f64) * 100.0 } else { 0.0 }
-        } else { 0.0 };
-        self.prev_sys_cpu = Some((total, idle));
-
-        let meminfo = read_meminfo();
-        let mem_total = *meminfo.get("MemTotal").unwrap_or(&0);
-        let mem_avail = *meminfo.get("MemAvailable").unwrap_or(&{
-            meminfo.get("MemFree").unwrap_or(&0)
-                + meminfo.get("Buffers").unwrap_or(&0)
-                + meminfo.get("Cached").unwrap_or(&0)
-        });
-        let mem_used = mem_total.saturating_sub(mem_avail);
-        let mem_percent = if mem_total > 0 { (mem_used as f64 / mem_total as f64) * 100.0 } else { 0.0 };
-
-        let swap_total = *meminfo.get("SwapTotal").unwrap_or(&0);
-        let swap_free = *meminfo.get("SwapFree").unwrap_or(&0);
-        let swap_used = swap_total.saturating_sub(swap_free);
-        let swap_percent = if swap_total > 0 { (swap_used as f64 / swap_total as f64) * 100.0 } else { 0.0 };
-
-        let load = fs::read_to_string("/proc/loadavg").ok()
-            .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
-            .unwrap_or_default();
-        let uptime = fs::read_to_string("/proc/uptime").ok()
-            .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
-            .map(|s| {
-                let s = s as u64;
-                let y = s/(365*86400); let r = s%(365*86400);
-                let d = r/86400; let r = r%86400; let h = r/3600; let r = r%3600;
-                let m = r/60; let sec = r%60;
-                format!("{}y {}d {}h {}m {}s", y, d, h, m, sec)
-            }).unwrap_or_default();
-        let (mut run, mut slp, mut zom) = (0,0,0);
-        for p in &self.raw_data {
-            match p.state {
-                'R' => run+=1, 'S'|'D' => slp+=1, 'Z' => zom+=1, _ => {}
-            }
-        }
-        let tasks = format!("{} ({} run, {} slp, {} zom)", self.raw_data.len(), run, slp, zom);
-        self.system_info = SystemInfo { cpu_percent, mem_percent, swap_percent, load, uptime, tasks };
-        self.apply_filter_and_sort();
     }
 
     fn apply_filter_and_sort(&mut self) {
@@ -427,7 +289,6 @@ impl App {
         self.data_rows = self.filtered_raw.iter().map(|p| self.format_row(p)).collect();
     }
 
-    // FIX #2: UTF-8 safe command scrolling
     fn format_row(&self, p: &ProcInfo) -> Vec<String> {
         let chars: Vec<char> = p.full_cmd.chars().collect();
         let max_offset = chars.len().saturating_sub(40);
@@ -539,8 +400,12 @@ impl App {
         let aligns = ["right","left","left","right","right","right","right","right"];
         let track = ansi_bg_rgb(40,40,40); let thumb = ansi_bg_rgb(120,120,120); let rst = ansi_reset();
 
-        let mut lines = Vec::with_capacity(self.term_height);
-        lines.push(sys); lines.push(header);
+        let mut out = io::stdout().lock();
+        execute!(out, cursor::MoveTo(0,0))?;
+        
+        write!(out, "{}\r\n", sys)?;
+        write!(out, "{}\r\n", header)?;
+        
         for idx in 0..visible {
             let didx = self.scroll_pos + idx;
             let row = if didx < total {
@@ -559,7 +424,7 @@ impl App {
                 } else { 0 };
                 if idx >= thumb_top && idx < thumb_top+thumb_h { format!("{thumb}  {rst}") } else { format!("{track}  {rst}") }
             } else { "  ".to_string() };
-            lines.push(format!("{}{}", row, scroll));
+            write!(out, "{}{}\r\n", row, scroll)?;
         }
 
         let totals = self.filtered_raw.iter().fold((0,0), |(pss,swp), p| (pss+p.pss_kb, swp+p.swap_kb));
@@ -568,11 +433,17 @@ impl App {
         let headers = ["1 PID","2 User","3 Command","4 PSS","5 USS","6 RSS","7 Swap","8 CPU%"];
         let arrow = if self.sort_reverse { "↓" } else { "↑" };
         let sort = format!("{} {}", headers[self.sort_col], arrow);
+        
+        let cpu_mode = if self.interval < 0.5 { " [NANO CPU]" } else { "" };
+        
         let left = if self.killing { format!("Kill PID: {}_ (Enter to confirm, Esc to cancel)", self.kill_pid_str) }
         else if self.searching { format!("Search: {}_ (Enter to accept, Esc to clear)", self.filter_string) }
-        else if !self.filter_string.is_empty() { format!("Filter: '{}' | {} | Interval: {} | / search", self.filter_string, sort, int_str) }
-        else { format!("Interval: {} | +/- change | q quit | k kill | ←→ cmd | ↑↓ scroll (5 lines) | Sort: {}", int_str, sort) };
+        else if !self.filter_string.is_empty() { format!("Filter: '{}' | {} | Interval: {}{} | / search", self.filter_string, sort, int_str, cpu_mode) }
+        else { format!("Interval: {}{} | +/- change | m mem-override | q quit | k kill | ←→ cmd | ↑↓ scroll | Sort: {}", int_str, cpu_mode, sort) };
+        
         let left = if self.cmd_offset > 0 { format!("{}  Cmd offset: {}", left, self.cmd_offset) } else { left };
+        let left = if self.mem_override { format!("{} [MEM OVERRIDE]", left) } else { left };
+        
         let status = if left.len() + tot_text.len() + 1 <= self.term_width {
             format!("{}{}{}", left, " ".repeat(self.term_width - left.len() - tot_text.len() - 1), tot_text)
         } else {
@@ -581,19 +452,281 @@ impl App {
         };
         let status_line = if self.no_color { format!("{: <width$}", status, width=self.term_width) }
         else { format!("{}{}{}{}", ansi_bg_rgb(60,60,60), ansi_fg_rgb(255,255,255), format!("{: <width$}", status, width=self.term_width), rst) };
-        lines.push(status_line);
-
-        let mut out = io::stdout();
-        execute!(out, cursor::MoveTo(0,0))?;
-        for (i,line) in lines.iter().enumerate() {
-            write!(out, "{}", line)?;
-            if i < lines.len() - 1 {
-                write!(out, "\r\n")?;
-            }
-        }
+        
+        write!(out, "{}", status_line)?;
         execute!(out, terminal::Clear(ClearType::FromCursorDown))?;
         out.flush()?;
         Ok(())
+    }
+}
+
+// ── Background Worker Logic ─────────────────────────────────────────
+struct WorkerState {
+    prev_cpu_times: HashMap<i32, (f64, Instant)>, 
+    prev_sys_cpu: Option<(u64, u64)>,
+    cached_static: HashMap<i32, (String, String, String)>, 
+    last_procs: HashMap<i32, ProcInfo>,
+    last_mem_update: Instant,
+    last_use_nano_mode: bool,
+}
+
+fn gather_data(
+    do_mem: bool,
+    use_nano_mode: bool,
+    state: &mut WorkerState,
+    user_map: &UserMap,
+    clk_tck: u64,
+    num_cpus: u64,
+) -> (Vec<ProcInfo>, SystemInfo) {
+    let mut procs = Vec::new();
+    let now = Instant::now();
+
+    if let Ok(dir) = fs::read_dir("/proc") {
+        for entry in dir.flatten() {
+            if let Some(pid_str) = entry.file_name().to_str() {
+                if pid_str.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(pid) = pid_str.parse::<i32>() {
+                        let stat_path = format!("/proc/{}/stat", pid);
+                        let stat_content = match fs::read_to_string(&stat_path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        
+                        let (state_char, utime, stime) = if let Some(rbracket) = stat_content.rfind(')') {
+                            let fields: Vec<&str> = stat_content[rbracket+2..].split_whitespace().collect();
+                            if fields.len() >= 13 {
+                                (fields[0].chars().next().unwrap_or('?'), 
+                                 fields[11].parse::<u64>().unwrap_or(0), 
+                                 fields[12].parse::<u64>().unwrap_or(0))
+                            } else { continue; }
+                        } else { continue; };
+
+                        // NANOSECOND PRECISION MODE (Thread-Aggregated)
+                        let mut use_nano_for_this_proc = use_nano_mode;
+                        let mut runtime_ns = 0.0;
+                        
+                        if use_nano_for_this_proc {
+                            let task_dir = format!("/proc/{}/task", pid);
+                            let mut sum_ns = 0.0;
+                            let mut found_any = false;
+                            
+                            if let Ok(tasks) = fs::read_dir(&task_dir) {
+                                for task in tasks.flatten() {
+                                    let schedstat_path = format!("{}/{}/schedstat", task_dir, task.file_name().to_string_lossy());
+                                    if let Ok(content) = fs::read_to_string(&schedstat_path) {
+                                        if let Some(ns_str) = content.split_whitespace().next() {
+                                            if let Ok(ns) = ns_str.parse::<f64>() {
+                                                sum_ns += ns;
+                                                found_any = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if found_any {
+                                runtime_ns = sum_ns;
+                            } else {
+                                use_nano_for_this_proc = false;
+                            }
+                        }
+
+                        let (mut pss_kb, mut uss_kb, mut rss_kb, mut swap_kb) = (0, 0, 0, 0);
+                        if do_mem {
+                            let smaps_path = format!("/proc/{}/smaps_rollup", pid);
+                            if let Ok(content) = fs::read_to_string(&smaps_path) {
+                                let mut private_clean = 0u64; let mut private_dirty = 0u64;
+                                for line in content.lines() {
+                                    let mut parts = line.split_whitespace();
+                                    match parts.next() {
+                                        Some("Pss:")           => pss_kb = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                                        Some("Rss:")           => rss_kb = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                                        Some("Private_Clean:") => private_clean = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                                        Some("Private_Dirty:") => private_dirty = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                                        Some("Swap:")          => swap_kb = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                                        _ => {}
+                                    }
+                                }
+                                uss_kb = private_clean + private_dirty;
+                            }
+                        } else if let Some(prev) = state.last_procs.get(&pid) {
+                            pss_kb = prev.pss_kb;
+                            uss_kb = prev.uss_kb;
+                            rss_kb = prev.rss_kb;
+                            swap_kb = prev.swap_kb;
+                        }
+
+                        let (user, cmd, full_cmd) = if let Some(cached) = state.cached_static.get(&pid) {
+                            cached.clone()
+                        } else {
+                            let uid: u32 = fs::read_to_string(format!("/proc/{}/status", pid))
+                                .ok()
+                                .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok()))
+                                .unwrap_or(0);
+                            let user = user_map.get(&uid).cloned().unwrap_or_else(|| uid.to_string());
+                            let full_cmd = fs::read_to_string(format!("/proc/{}/cmdline", pid))
+                                .unwrap_or_default().replace('\0', " ").trim().to_string();
+                            let full_cmd = full_cmd.chars().take(2040).collect::<String>();
+                            let cmd = full_cmd.chars().take(40).collect::<String>();
+                            let res = (user, cmd, full_cmd);
+                            state.cached_static.insert(pid, res.clone());
+                            res
+                        };
+
+                        if rss_kb == 0 { continue; }
+
+                        let current_val = if use_nano_for_this_proc { runtime_ns } else { (utime + stime) as f64 };
+                        let mut cpu_percent = 0.0;
+                        
+                        if let Some(&(prev_val, prev_time)) = state.prev_cpu_times.get(&pid) {
+                            let delta = current_val - prev_val;
+                            let dt = now.duration_since(prev_time).as_secs_f64();
+                            if dt > 0.0 && delta >= 0.0 {
+                                if use_nano_for_this_proc {
+                                    cpu_percent = (delta / 1_000_000_000.0 / dt / num_cpus as f64) * 100.0;
+                                } else {
+                                    cpu_percent = (delta / clk_tck as f64 / dt / num_cpus as f64) * 100.0;
+                                }
+                            }
+                        }
+                        state.prev_cpu_times.insert(pid, (current_val, now));
+
+                        procs.push(ProcInfo {
+                            pid, user, cmd, full_cmd, pss_kb, uss_kb, rss_kb, swap_kb,
+                            state: state_char, cpu_percent
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    let active_pids: HashSet<i32> = procs.iter().map(|p| p.pid).collect();
+    state.prev_cpu_times.retain(|pid, _| active_pids.contains(pid));
+    state.cached_static.retain(|pid, _| active_pids.contains(pid));
+
+    let (total, idle) = read_cpu_times();
+    let cpu_percent = if let Some((prev_total, prev_idle)) = state.prev_sys_cpu {
+        let d_total = total.saturating_sub(prev_total);
+        let d_idle = idle.saturating_sub(prev_idle);
+        if d_total > 0 { (1.0 - d_idle as f64 / d_total as f64) * 100.0 } else { 0.0 }
+    } else { 0.0 };
+    state.prev_sys_cpu = Some((total, idle));
+
+    let meminfo = read_meminfo();
+    let mem_total = *meminfo.get("MemTotal").unwrap_or(&0);
+    let mem_avail = *meminfo.get("MemAvailable").unwrap_or(&{
+        meminfo.get("MemFree").unwrap_or(&0)
+            + meminfo.get("Buffers").unwrap_or(&0)
+            + meminfo.get("Cached").unwrap_or(&0)
+    });
+    let mem_used = mem_total.saturating_sub(mem_avail);
+    let mem_percent = if mem_total > 0 { (mem_used as f64 / mem_total as f64) * 100.0 } else { 0.0 };
+
+    let swap_total = *meminfo.get("SwapTotal").unwrap_or(&0);
+    let swap_free = *meminfo.get("SwapFree").unwrap_or(&0);
+    let swap_used = swap_total.saturating_sub(swap_free);
+    let swap_percent = if swap_total > 0 { (swap_used as f64 / swap_total as f64) * 100.0 } else { 0.0 };
+
+    let load = fs::read_to_string("/proc/loadavg").ok()
+        .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    let uptime = fs::read_to_string("/proc/uptime").ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .map(|s| {
+            let s = s as u64;
+            let y = s/(365*86400); let r = s%(365*86400);
+            let d = r/86400; let r = r%86400; let h = r/3600; let r = r%3600;
+            let m = r/60; let sec = r%60;
+            format!("{}y {}d {}h {}m {}s", y, d, h, m, sec)
+        }).unwrap_or_default();
+        
+    let (mut run, mut slp, mut zom) = (0,0,0);
+    for p in &procs {
+        match p.state {
+            'R' => run+=1, 'S'|'D' => slp+=1, 'Z' => zom+=1, _ => {}
+        }
+    }
+    let tasks = format!("{} ({} run, {} slp, {} zom)", procs.len(), run, slp, zom);
+    
+    let sys_info = SystemInfo { cpu_percent, mem_percent, swap_percent, load, uptime, tasks };
+
+    (procs, sys_info)
+}
+
+fn worker_loop(
+    tx: mpsc::Sender<(Vec<ProcInfo>, SystemInfo)>,
+    interval_shared: Arc<AtomicU64>,
+    mem_override_shared: Arc<AtomicBool>,
+    user_map: UserMap,
+    clk_tck: u64,
+    num_cpus: u64,
+) {
+    let mut state = WorkerState {
+        prev_cpu_times: HashMap::new(),
+        prev_sys_cpu: None,
+        cached_static: HashMap::new(),
+        last_procs: HashMap::new(),
+        last_mem_update: Instant::now() - Duration::from_secs(10),
+        last_use_nano_mode: false,
+    };
+
+    // FIX 2: Prime the CPU cache so the very first frame has accurate CPU %
+    let priming_int = f64::from_bits(interval_shared.load(Ordering::Relaxed));
+    let priming_nano = priming_int < 0.5;
+    let _ = gather_data(true, priming_nano, &mut state, &user_map, clk_tck, num_cpus);
+    thread::sleep(Duration::from_millis(100)); // Wait 100ms to accumulate a delta
+
+    loop {
+        let start = Instant::now();
+        let int_sec = f64::from_bits(interval_shared.load(Ordering::Relaxed));
+        
+        let use_nano_mode = int_sec < 0.5; 
+        
+        if state.last_use_nano_mode != use_nano_mode {
+            state.prev_cpu_times.clear();
+            state.last_use_nano_mode = use_nano_mode;
+            // Re-prime if mode switched to avoid massive delta spikes
+            let _ = gather_data(true, use_nano_mode, &mut state, &user_map, clk_tck, num_cpus);
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let do_mem = mem_override_shared.load(Ordering::Relaxed) || state.last_mem_update.elapsed().as_secs_f64() >= 2.0;
+        if do_mem {
+            state.last_mem_update = Instant::now();
+        }
+
+        let (procs, sys) = gather_data(do_mem, use_nano_mode, &mut state, &user_map, clk_tck, num_cpus);
+        
+        state.last_procs.clear();
+        for p in &procs {
+            state.last_procs.insert(p.pid, p.clone());
+        }
+
+        let _ = tx.send((procs, sys));
+
+        let elapsed = start.elapsed();
+        let sleep_time = int_sec - elapsed.as_secs_f64();
+        let start_mem_ov = mem_override_shared.load(Ordering::Relaxed);
+        
+        // FIX 1: Interruptible sleep to immediately react to interval/setting changes
+        if sleep_time > 0.0 {
+            let mut remaining = sleep_time;
+            while remaining > 0.0 {
+                let chunk = remaining.min(0.05); // Check every 50ms
+                thread::sleep(Duration::from_secs_f64(chunk));
+                
+                let new_int = f64::from_bits(interval_shared.load(Ordering::Relaxed));
+                let new_mem_ov = mem_override_shared.load(Ordering::Relaxed);
+                
+                if new_int != int_sec || new_mem_ov != start_mem_ov {
+                    break; // Wake up immediately on settings change
+                }
+                remaining -= chunk;
+            }
+        } else {
+            thread::yield_now();
+        }
     }
 }
 
@@ -615,17 +748,35 @@ fn main() -> io::Result<()> {
         interval = intervals.iter().min_by(|a,b| (**a-interval).abs().partial_cmp(&(**b-interval).abs()).unwrap()).copied().unwrap_or(2.0);
     }
 
-    // Removed unused `let mut out = io::stdout();` to fix compiler warnings
+    let interval_shared = Arc::new(AtomicU64::new(interval.to_bits()));
+    let mem_override_shared = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+
+    let user_map = build_user_map();
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+    let num_cpus = num_cpus::get() as u64;
+
+    thread::spawn({
+        let interval_shared = Arc::clone(&interval_shared);
+        let mem_override_shared = Arc::clone(&mem_override_shared);
+        let user_map = user_map.clone();
+        move || {
+            worker_loop(tx, interval_shared, mem_override_shared, user_map, clk_tck, num_cpus);
+        }
+    });
+
     let _guard = TerminalGuard::new()?;
-    
     let mut app = App::new(interval, no_color);
-    app.full_update(); app.compute_widths(); app.scroll_pos=0;
-    app.render()?;
-    app.last_refresh = Instant::now();
+    
+    app.render()?; 
+
+    let mut last_render = Instant::now();
+    let mut current_data = (Vec::new(), SystemInfo::default());
+    let mut ui_dirty = true;
 
     'outer: loop {
-        let timeout = if app.searching || app.killing { Duration::from_secs_f64(0.1) } else { Duration::from_secs_f64(app.interval) };
-        if event::poll(timeout)? {
+        let poll_timeout = Duration::from_millis(16);
+        if event::poll(poll_timeout)? {
             let mut keys = Vec::new();
             loop {
                 if let Event::Key(k) = event::read()? { keys.push(k); }
@@ -634,49 +785,61 @@ fn main() -> io::Result<()> {
             for key in keys {
                 if app.killing {
                     match key.code {
-                        KeyCode::Esc => { app.killing=false; app.kill_pid_str.clear(); app.render()?; continue; }
+                        KeyCode::Esc => { app.killing=false; app.kill_pid_str.clear(); ui_dirty = true; continue; }
                         KeyCode::Enter => {
                             if !app.kill_pid_str.is_empty() && app.kill_pid_str.chars().all(|c| c.is_ascii_digit()) {
                                 if let Ok(pid) = app.kill_pid_str.parse::<i32>() { unsafe { libc::kill(pid, libc::SIGTERM); } }
                             }
-                            app.killing=false; app.kill_pid_str.clear(); app.full_update(); app.scroll_pos=0;
-                            app.last_refresh=Instant::now(); app.render()?; continue;
+                            app.killing=false; app.kill_pid_str.clear(); ui_dirty = true; continue;
                         }
-                        KeyCode::Backspace|KeyCode::Delete => { app.kill_pid_str.pop(); app.render()?; continue; }
-                        KeyCode::Char(c) if c.is_ascii_digit() => { app.kill_pid_str.push(c); app.render()?; continue; }
+                        KeyCode::Backspace|KeyCode::Delete => { app.kill_pid_str.pop(); ui_dirty = true; continue; }
+                        KeyCode::Char(c) if c.is_ascii_digit() => { app.kill_pid_str.push(c); ui_dirty = true; continue; }
                         _ => continue,
                     }
                 }
                 if app.searching {
                     match key.code {
-                        KeyCode::Esc => { app.filter_string.clear(); app.searching=false; app.full_update(); app.scroll_pos=0; app.last_refresh=Instant::now(); app.render()?; continue; }
-                        KeyCode::Enter => { app.searching=false; app.full_update(); app.scroll_pos=0; app.last_refresh=Instant::now(); app.render()?; continue; }
-                        KeyCode::Backspace|KeyCode::Delete => { app.filter_string.pop(); app.render()?; continue; }
-                        KeyCode::Char(c) if c.is_ascii_graphic()||c==' ' => { app.filter_string.push(c); app.render()?; continue; }
+                        KeyCode::Esc => { app.filter_string.clear(); app.searching=false; ui_dirty = true; continue; }
+                        KeyCode::Enter => { app.searching=false; ui_dirty = true; continue; }
+                        KeyCode::Backspace|KeyCode::Delete => { app.filter_string.pop(); ui_dirty = true; continue; }
+                        KeyCode::Char(c) if c.is_ascii_graphic()||c==' ' => { app.filter_string.push(c); ui_dirty = true; continue; }
                         _ => continue,
                     }
                 }
                 match key.code {
                     KeyCode::Char('q')|KeyCode::Char('Q') => break 'outer,
-                    KeyCode::Char('/') => { app.searching=true; app.render()?; continue; }
-                    KeyCode::Char('k')|KeyCode::Char('K') => { app.killing=true; app.kill_pid_str.clear(); app.render()?; continue; }
-                    KeyCode::Esc => { app.filter_string.clear(); app.full_update(); app.scroll_pos=0; app.last_refresh=Instant::now(); app.render()?; continue; }
-                    KeyCode::Up => { app.scroll_pos = app.scroll_pos.saturating_sub(5); app.render()?; }
+                    KeyCode::Char('/') => { app.searching=true; ui_dirty = true; continue; }
+                    KeyCode::Char('k')|KeyCode::Char('K') => { app.killing=true; app.kill_pid_str.clear(); ui_dirty = true; continue; }
+                    KeyCode::Char('m')|KeyCode::Char('M') => { 
+                        app.mem_override = !app.mem_override; 
+                        mem_override_shared.store(app.mem_override, Ordering::Relaxed); 
+                        ui_dirty = true; 
+                    }
+                    KeyCode::Esc => { app.filter_string.clear(); ui_dirty = true; continue; }
+                    KeyCode::Up => { app.scroll_pos = app.scroll_pos.saturating_sub(5); ui_dirty = true; }
                     KeyCode::Down => {
                         let vis = app.term_height.saturating_sub(3);
                         let max = if app.data_rows.len()>vis { app.data_rows.len()-vis } else { 0 };
-                        app.scroll_pos = (app.scroll_pos+5).min(max); app.render()?;
+                        app.scroll_pos = (app.scroll_pos+5).min(max); ui_dirty = true;
                     }
-                    KeyCode::Left => { app.cmd_offset = app.cmd_offset.saturating_sub(40); app.soft_update(); app.render()?; continue; }
-                    KeyCode::Right => { app.cmd_offset = (app.cmd_offset+40).min(2000); app.soft_update(); app.render()?; continue; }
+                    KeyCode::Left => { app.cmd_offset = app.cmd_offset.saturating_sub(40); app.soft_update(); ui_dirty = true; continue; }
+                    KeyCode::Right => { app.cmd_offset = (app.cmd_offset+40).min(2000); app.soft_update(); ui_dirty = true; continue; }
                     KeyCode::Char('+')|KeyCode::Char('=') => {
                         if let Some(pos) = intervals.iter().position(|&v| v==app.interval) {
-                            if pos < intervals.len()-1 { app.interval = intervals[pos+1]; app.last_refresh=Instant::now(); app.full_update(); app.compute_widths(); app.render()?; }
+                            if pos < intervals.len()-1 { 
+                                app.interval = intervals[pos+1]; 
+                                interval_shared.store(app.interval.to_bits(), Ordering::Relaxed);
+                                ui_dirty = true; 
+                            }
                         }
                     }
                     KeyCode::Char('-') => {
                         if let Some(pos) = intervals.iter().position(|&v| v==app.interval) {
-                            if pos > 0 { app.interval = intervals[pos-1]; app.last_refresh=Instant::now(); app.full_update(); app.compute_widths(); app.render()?; }
+                            if pos > 0 { 
+                                app.interval = intervals[pos-1]; 
+                                interval_shared.store(app.interval.to_bits(), Ordering::Relaxed);
+                                ui_dirty = true; 
+                            }
                         }
                     }
                     KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -685,25 +848,52 @@ fn main() -> io::Result<()> {
                             let col = n-1;
                             if col == app.sort_col { app.sort_reverse = !app.sort_reverse; }
                             else { app.sort_col = col; app.sort_reverse = col>2; }
-                            app.soft_update(); app.scroll_pos=0; app.render()?; app.last_refresh=Instant::now();
+                            app.soft_update(); app.scroll_pos=0; ui_dirty = true;
                         }
                     }
                     _ => {}
                 }
             }
         }
-        if !app.killing && app.last_refresh.elapsed().as_secs_f64() >= app.interval {
-            app.full_update(); app.compute_widths(); app.last_refresh = Instant::now();
+
+        let mut got_new_data = false;
+        while let Ok(new_data) = rx.try_recv() {
+            current_data = new_data;
+            got_new_data = true;
+        }
+
+        // Freeze the process list data when in kill mode so rows don't jump around
+        let data_frozen = app.killing;
+        let update_data = got_new_data && !data_frozen;
+
+        let render_interval = if app.searching || app.killing { 0.1 } else { app.interval };
+        let time_since_render = last_render.elapsed().as_secs_f64();
+        
+        if update_data || ui_dirty || time_since_render >= render_interval {
+            if update_data {
+                app.raw_data = current_data.0.clone();
+                app.system_info = current_data.1.clone();
+            }
+            app.apply_filter_and_sort();
+            app.compute_widths();
+            
             let vis = app.term_height.saturating_sub(3);
-            let max = if app.data_rows.len()>vis { app.data_rows.len()-vis } else { 0 };
+            let max = if app.data_rows.len() > vis { app.data_rows.len() - vis } else { 0 };
             app.scroll_pos = app.scroll_pos.min(max);
             if app.searching { app.scroll_pos = 0; }
+            
             app.render()?;
+            last_render = Instant::now();
+            ui_dirty = false;
         }
+
         if terminal::size().map(|(w,h)| w as usize != app.term_width || h as usize != app.term_height).unwrap_or(false) {
             let (w,h) = terminal::size().unwrap_or((80,24));
             app.term_width = w as usize; app.term_height = h as usize;
-            app.compute_widths(); app.render()?;
+            app.compute_widths(); 
+            app.render()?;
+            last_render = Instant::now();
+            ui_dirty = false;
         }
     }
     Ok(())

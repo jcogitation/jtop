@@ -2,3 +2,5 @@
 *.rlib
 *.rmeta
 Cargo.lock
+core.*
+*.log
