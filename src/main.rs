@@ -51,8 +51,10 @@ const INDIGO_DESAT:  (u8, u8, u8) = (111, 81, 161);
 const WHITE_DIMMER:  (u8, u8, u8) = (200, 200, 200);
 const WHITE_PURE:    (u8, u8, u8) = (255, 255, 255);
 const CYAN_BRIGHT:   (u8, u8, u8) = (0, 255, 255);
+const GRAY_THREAD:   (u8, u8, u8) = (120, 120, 120);
 
-fn format_memory(kib: u64) -> String {
+fn format_memory(kib: u64, is_thread: bool) -> String {
+    if is_thread { return "---".to_string(); }
     if kib == 0 { return "0 KiB".to_string(); }
     let mib = kib as f64 / 1024.0;
     if mib >= 1000.0 { format!("{} MiB", mib.round() as u64) }
@@ -159,10 +161,12 @@ fn build_user_map() -> UserMap {
     map
 }
 
-// ── Process info struct ──────────────────────────────────────────────
+// ── Process/Thread info struct ──────────────────────────────────────
 #[derive(Clone)]
 struct ProcInfo {
     pid: i32,
+    tid: i32,
+    ppid: i32,
     user: String,
     cmd: String,
     full_cmd: String,
@@ -172,21 +176,8 @@ struct ProcInfo {
     swap_kb: u64,
     state: char,
     cpu_percent: f64,
-}
-
-fn sort_procs(procs: &mut Vec<ProcInfo>, col: usize, reverse: bool) {
-    match col {
-        0 => procs.sort_by_key(|p| p.pid),
-        1 => procs.sort_by(|a, b| a.user.to_lowercase().cmp(&b.user.to_lowercase())),
-        2 => procs.sort_by(|a, b| a.cmd.to_lowercase().cmp(&b.cmd.to_lowercase())),
-        3 => procs.sort_by_key(|p| p.pss_kb),
-        4 => procs.sort_by_key(|p| p.uss_kb),
-        5 => procs.sort_by_key(|p| p.rss_kb),
-        6 => procs.sort_by_key(|p| p.swap_kb),
-        7 => procs.sort_by(|a, b| a.cpu_percent.partial_cmp(&b.cpu_percent).unwrap_or(std::cmp::Ordering::Equal)),
-        _ => {}
-    }
-    if reverse { procs.reverse(); }
+    is_thread: bool,
+    tree_indent: String, // ✅ Stores the pre-calculated tree prefix
 }
 
 fn color_pss(size_bytes: u64, limit_red_bytes: u64) -> (u8, u8, u8) {
@@ -240,6 +231,7 @@ struct App {
     filter_string: String, searching: bool, 
     kill_mode: bool, kill_selected: usize, marked_pids: HashSet<i32>, kill_confirming: bool,
     cmd_offset: usize,
+    tree_mode: bool, thread_mode: bool, collapsed_pids: HashSet<i32>,
     system_info: SystemInfo,
     scroll_pos: usize, mem_override: bool,
 }
@@ -269,54 +261,217 @@ impl App {
             filter_string: String::new(), searching: false,
             kill_mode: false, kill_selected: 0, marked_pids: HashSet::new(), kill_confirming: false,
             cmd_offset: 0,
+            tree_mode: false, thread_mode: false, collapsed_pids: HashSet::new(),
             system_info: SystemInfo::default(), scroll_pos: 0,
             mem_override: false,
         }
     }
 
     fn apply_filter_and_sort(&mut self) {
-        if self.filter_string.is_empty() {
+        if !self.tree_mode && self.filter_string.is_empty() {
             self.filtered_raw = self.raw_data.clone();
-        } else {
+            match self.sort_col {
+                0 => self.filtered_raw.sort_by_key(|p| p.pid),
+                1 => self.filtered_raw.sort_by(|a, b| a.user.to_lowercase().cmp(&b.user.to_lowercase())),
+                2 => self.filtered_raw.sort_by(|a, b| a.cmd.to_lowercase().cmp(&b.cmd.to_lowercase())),
+                3 => self.filtered_raw.sort_by_key(|p| p.pss_kb),
+                4 => self.filtered_raw.sort_by_key(|p| p.uss_kb),
+                5 => self.filtered_raw.sort_by_key(|p| p.rss_kb),
+                6 => self.filtered_raw.sort_by_key(|p| p.swap_kb),
+                7 => self.filtered_raw.sort_by(|a, b| a.cpu_percent.partial_cmp(&b.cpu_percent).unwrap_or(std::cmp::Ordering::Equal)),
+                _ => {}
+            }
+            if self.sort_reverse { self.filtered_raw.reverse(); }
+        } else if !self.tree_mode && !self.filter_string.is_empty() {
             let lower = self.filter_string.to_lowercase();
             self.filtered_raw = self.raw_data.iter()
-                .filter(|p| p.full_cmd.to_lowercase().contains(&lower))
-                .cloned().collect();
-        }
-        sort_procs(&mut self.filtered_raw, self.sort_col, self.sort_reverse);
-        self.data_rows = self.filtered_raw.iter().map(|p| self.format_row(p)).collect();
-    }
+                .filter(|p| {
+                    p.full_cmd.to_lowercase().contains(&lower) || 
+                    p.pid.to_string().contains(&lower) ||
+                    p.user.to_lowercase().contains(&lower)
+                })
+                .cloned()
+                .collect();
+            
+            match self.sort_col {
+                0 => self.filtered_raw.sort_by_key(|p| p.pid),
+                1 => self.filtered_raw.sort_by(|a, b| a.user.to_lowercase().cmp(&b.user.to_lowercase())),
+                2 => self.filtered_raw.sort_by(|a, b| a.cmd.to_lowercase().cmp(&b.cmd.to_lowercase())),
+                3 => self.filtered_raw.sort_by_key(|p| p.pss_kb),
+                4 => self.filtered_raw.sort_by_key(|p| p.uss_kb),
+                5 => self.filtered_raw.sort_by_key(|p| p.rss_kb),
+                6 => self.filtered_raw.sort_by_key(|p| p.swap_kb),
+                7 => self.filtered_raw.sort_by(|a, b| a.cpu_percent.partial_cmp(&b.cpu_percent).unwrap_or(std::cmp::Ordering::Equal)),
+                _ => {}
+            }
+            if self.sort_reverse { self.filtered_raw.reverse(); }
+        } else {
+            // Tree mode logic
+            let lower = self.filter_string.to_lowercase();
+            let matches_filter = |p: &ProcInfo| -> bool {
+                if lower.is_empty() { return true; }
+                p.full_cmd.to_lowercase().contains(&lower) || p.pid.to_string().contains(&lower)
+            };
 
-    fn soft_update(&mut self) {
-        sort_procs(&mut self.filtered_raw, self.sort_col, self.sort_reverse);
+            let mut children_map: HashMap<i32, Vec<i32>> = HashMap::new();
+            let mut proc_map: HashMap<i32, &ProcInfo> = HashMap::new();
+            let all_pids: HashSet<i32> = self.raw_data.iter().filter(|p| !p.is_thread).map(|p| p.pid).collect();
+            let mut all_roots: Vec<i32> = Vec::new();
+
+            for p in &self.raw_data {
+                if p.is_thread { continue; }
+                proc_map.insert(p.pid, p);
+                children_map.entry(p.ppid).or_default().push(p.pid);
+                if p.ppid == 0 || !all_pids.contains(&p.ppid) {
+                    all_roots.push(p.pid);
+                }
+            }
+
+            for children in children_map.values_mut() {
+                children.sort();
+            }
+
+            let mut marked = HashSet::new();
+            let mut ancestors: HashMap<i32, i32> = HashMap::new();
+            for p in &self.raw_data {
+                if p.is_thread { continue; }
+                if matches_filter(p) { marked.insert(p.pid); }
+                ancestors.insert(p.pid, p.ppid);
+            }
+
+            if !self.filter_string.is_empty() && self.tree_mode {
+                let mut queue: Vec<i32> = marked.iter().copied().collect();
+                while let Some(pid) = queue.pop() {
+                    if let Some(ppid) = ancestors.get(&pid) {
+                        if all_pids.contains(ppid) && !marked.contains(ppid) {
+                            marked.insert(*ppid);
+                            queue.push(*ppid);
+                        }
+                    }
+                }
+            }
+
+            let mut result = Vec::new();
+            let mut visited = HashSet::new();
+            let all_threads: Vec<&ProcInfo> = self.raw_data.iter().filter(|p| p.is_thread).collect();
+
+            fn dfs(
+                pid: i32,
+                ancestors_prefix: String,
+                is_last: bool,
+                children_map: &HashMap<i32, Vec<i32>>,
+                proc_map: &HashMap<i32, &ProcInfo>,
+                marked: &HashSet<i32>,
+                collapsed: &HashSet<i32>,
+                result: &mut Vec<ProcInfo>,
+                visited: &mut HashSet<i32>,
+                thread_mode: bool,
+                all_threads: &[&ProcInfo],
+            ) {
+                if visited.contains(&pid) || !marked.contains(&pid) { return; }
+                visited.insert(pid);
+
+                if let Some(&proc) = proc_map.get(&pid) {
+                    let mut proc_with_info = proc.clone();
+                    let connector = if is_last { "└─ " } else { "─ " };
+                    // ✅ Fixed: Clone ancestors_prefix to prevent move error
+                    proc_with_info.tree_indent = ancestors_prefix.clone() + connector;
+                    result.push(proc_with_info);
+                }
+
+                if collapsed.contains(&pid) { return; }
+
+                // Calculate next prefix for children
+                let next_ancestors_prefix = ancestors_prefix + if is_last { "   " } else { "│  " };
+
+                // Collect threads for this process to determine if processes are "last"
+                let threads: Vec<&ProcInfo> = all_threads.iter()
+                    .filter(|t| t.ppid == pid)
+                    .copied()
+                    .collect();
+                let has_threads = !threads.is_empty();
+
+                if let Some(children) = children_map.get(&pid) {
+                    for (i, &child) in children.iter().enumerate() {
+                        // If there are threads, the last process is NOT the last child
+                        let child_is_last = (i == children.len() - 1) && !has_threads;
+                        dfs(child, next_ancestors_prefix.clone(), child_is_last, children_map, proc_map, marked, collapsed, result, visited, thread_mode, all_threads);
+                    }
+                }
+
+                if thread_mode && has_threads {
+                    let mut sorted_threads = threads;
+                    sorted_threads.sort_by_key(|t| t.tid);
+                    for (i, t) in sorted_threads.iter().enumerate() {
+                        let thread_is_last = i == sorted_threads.len() - 1;
+                        let mut thread_with_info = (*t).clone();
+                        let connector = if thread_is_last { "└─ " } else { "├─ " };
+                        thread_with_info.tree_indent = next_ancestors_prefix.clone() + connector;
+                        result.push(thread_with_info);
+                    }
+                }
+            }
+
+            for (i, &root) in all_roots.iter().enumerate() {
+                if marked.contains(&root) || !visited.contains(&root) {
+                    let root_is_last = i == all_roots.len() - 1;
+                    dfs(root, String::new(), root_is_last, &children_map, &proc_map, &marked, &self.collapsed_pids, &mut result, &mut visited, self.thread_mode, &all_threads);
+                }
+            }
+
+            // ✅ DISABLE SORTING IN TREE MODE TO PRESERVE HIERARCHY
+            // Sorting would scatter children away from parents
+
+            self.filtered_raw = result;
+        }
         self.data_rows = self.filtered_raw.iter().map(|p| self.format_row(p)).collect();
     }
 
     fn format_row(&self, p: &ProcInfo) -> Vec<String> {
+        // ✅ Use pre-calculated tree_indent
+        let indent = if self.tree_mode { &p.tree_indent } else { "" };
+
         let chars: Vec<char> = p.full_cmd.chars().collect();
         let max_offset = chars.len().saturating_sub(40);
         let offset = self.cmd_offset.min(max_offset);
         let displayed: String = chars.iter().skip(offset).take(40).collect();
-        let cmd_str = format!("{: <40}", displayed);
+        let cmd_str = format!("{}{: <40}", indent, displayed);
         
-        let pid = format!("{}", p.pid);
+        let pid_str = if p.is_thread { format!("{}", p.tid) } else { format!("{}", p.pid) };
         let user = &p.user;
 
-        let pid_cell = if self.no_color { pid.clone() } else { color_text_rgb(YELLOW_BRIGHT.0, YELLOW_BRIGHT.1, YELLOW_BRIGHT.2, &pid) };
+        let pid_cell = if self.no_color { pid_str.clone() } else { 
+            let col = if p.is_thread { GRAY_THREAD } else { YELLOW_BRIGHT };
+            color_text_rgb(col.0, col.1, col.2, &pid_str) 
+        };
         let user_cell = if self.no_color { user.clone() } else {
             let (r,g,b) = if *user == self.current_user { BLUE_BRIGHT } else if user == "root" { RED_DESAT } else { INDIGO_DESAT };
             color_text_rgb(r,g,b, user)
         };
         let cmd_cell = if self.no_color { cmd_str.clone() } else { color_text_rgb(WHITE_DIMMER.0, WHITE_DIMMER.1, WHITE_DIMMER.2, &cmd_str) };
 
-        let pss = format_memory(p.pss_kb); let uss = format_memory(p.uss_kb);
-        let rss = format_memory(p.rss_kb); let swap = format_memory(p.swap_kb);
+        let pss = format_memory(p.pss_kb, p.is_thread); 
+        let uss = format_memory(p.uss_kb, p.is_thread);
+        let rss = format_memory(p.rss_kb, p.is_thread); 
+        let swap = format_memory(p.swap_kb, p.is_thread);
         let cpu = format!("{:5.1}", p.cpu_percent);
 
-        let pss_cell = if self.no_color { pss.clone() } else { let (r,g,b)=color_pss(p.pss_kb*1024,self.limit_red_bytes); color_text_rgb(r,g,b,&pss) };
-        let uss_cell = if self.no_color { uss.clone() } else { let (r,g,b)=color_pss(p.uss_kb*1024,self.limit_red_bytes); color_text_rgb(r,g,b,&uss) };
-        let rss_cell = if self.no_color { rss.clone() } else { let (r,g,b)=color_rss(p.rss_kb*1024,self.mem_total_bytes); color_text_rgb(r,g,b,&rss) };
-        let swap_cell = if self.no_color { swap.clone() } else { let (r,g,b)=color_swap(p.swap_kb*1024,self.swap_total_bytes); color_text_rgb(r,g,b,&swap) };
+        let pss_cell = if self.no_color { pss.clone() } else { 
+            if p.is_thread { color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &pss) }
+            else { let (r,g,b)=color_pss(p.pss_kb*1024,self.limit_red_bytes); color_text_rgb(r,g,b,&pss) } 
+        };
+        let uss_cell = if self.no_color { uss.clone() } else { 
+            if p.is_thread { color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &uss) }
+            else { let (r,g,b)=color_pss(p.uss_kb*1024,self.limit_red_bytes); color_text_rgb(r,g,b,&uss) } 
+        };
+        let rss_cell = if self.no_color { rss.clone() } else { 
+            if p.is_thread { color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &rss) }
+            else { let (r,g,b)=color_rss(p.rss_kb*1024,self.mem_total_bytes); color_text_rgb(r,g,b,&rss) } 
+        };
+        let swap_cell = if self.no_color { swap.clone() } else { 
+            if p.is_thread { color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &swap) }
+            else { let (r,g,b)=color_swap(p.swap_kb*1024,self.swap_total_bytes); color_text_rgb(r,g,b,&swap) } 
+        };
         let cpu_cell = if self.no_color { cpu.clone() } else { let (r,g,b)=color_cpu(p.cpu_percent); color_text_rgb(r,g,b,&cpu) };
 
         vec![pid_cell, user_cell, cmd_cell, pss_cell, uss_cell, rss_cell, swap_cell, cpu_cell]
@@ -333,12 +488,9 @@ impl App {
         }
     }
 
-    fn build_header_line(&self, kill_mode: bool) -> String {
+    fn build_header_line(&self) -> String {
         let headers = ["1 PID","2 User","3 Command","4 PSS","5 USS","6 RSS","7 Swap","8 CPU%"];
-        let mut positions: [usize; 8] = [1,8,24,69,79,89,98,105];
-        if kill_mode {
-            for p in &mut positions { *p += 4; }
-        }
+        let positions: [usize; 8] = [1,8,24,69,79,89,98,105];
         let mut line = String::new(); let mut col = 0;
         for (i, label) in headers.iter().enumerate() {
             let pos = positions[i];
@@ -401,7 +553,7 @@ impl App {
         self.scroll_pos = self.scroll_pos.min(max_scroll);
 
         let sys = self.build_system_line();
-        let header = self.build_header_line(self.kill_mode);
+        let header = self.build_header_line();
         let gaps = [2,1,2,2,2,2,2];
         let aligns = ["right","left","left","right","right","right","right","right"];
         let track = ansi_bg_rgb(40,40,40); let thumb = ansi_bg_rgb(120,120,120); let rst = ansi_reset();
@@ -421,7 +573,7 @@ impl App {
                 for (i,c) in cells.iter().enumerate() { line.push_str(c); if i<gaps.len() { line.push_str(&" ".repeat(gaps[i])); } }
                 
                 if self.kill_mode && didx < self.filtered_raw.len() {
-                    let pid = self.filtered_raw[didx].pid;
+                    let pid = if self.filtered_raw[didx].is_thread { self.filtered_raw[didx].tid } else { self.filtered_raw[didx].pid };
                     let is_marked = self.marked_pids.contains(&pid);
                     let is_selected = didx == self.kill_selected;
                     let marker = if is_selected && is_marked { "[*] " }
@@ -450,34 +602,37 @@ impl App {
             write!(out, "{}{}\r\n", row, scroll)?;
         }
 
-        let totals = self.filtered_raw.iter().fold((0,0), |(pss,swp), p| (pss+p.pss_kb, swp+p.swap_kb));
-        let tot_text = format!("PSS: {}  Swap: {}", format_memory(totals.0), format_memory(totals.1));
+        let totals = self.filtered_raw.iter()
+            .filter(|p| !p.is_thread)
+            .fold((0u64, 0u64), |(pss,swp), p| (pss + p.pss_kb, swp + p.swap_kb));
+        let tot_text = format!("PSS: {}  Swap: {}", format_memory(totals.0, false), format_memory(totals.1, false));
+        
         let int_str = if self.interval.fract()==0.0 { format!("{}s", self.interval as u64) } else { format!("{}s", self.interval) };
         let headers = ["1 PID","2 User","3 Command","4 PSS","5 USS","6 RSS","7 Swap","8 CPU%"];
         let arrow = if self.sort_reverse { "↓" } else { "↑" };
         let sort = format!("{} {}", headers[self.sort_col], arrow);
         
         let cpu_mode = if self.interval < 0.5 { " [NANO CPU]" } else { "" };
+        let mode_tags = if self.tree_mode && self.thread_mode { " [TREE+THREADS]" }
+                        else if self.tree_mode { " [TREE]" }
+                        else if self.thread_mode { " [THREADS]" }
+                        else { "" };
         
         let left = if self.kill_confirming {
-            format!("Kill {} marked process(es)? Are you sure? y/n", self.marked_pids.len())
+            format!("Kill {} marked process(es)/thread(s)? y/n", self.marked_pids.len())
         } else if self.kill_mode {
             let marked_count = self.marked_pids.len();
             format!("KILL MODE: ↑↓ select | Space mark | Enter confirm | Esc cancel | Marked: {}", marked_count)
         } else if self.searching { 
-            format!("Search: {}_ (Enter to accept, Esc to clear)", self.filter_string) 
+            format!("Search: {}_ (Enter accept, Esc clear)", self.filter_string) 
         } else if !self.filter_string.is_empty() { 
-            format!("Filter: '{}' | {} | Interval: {}{} | / search", self.filter_string, sort, int_str, cpu_mode) 
+            format!("Filter: '{}' | {}{} | Interval: {} | / search", self.filter_string, sort, cpu_mode, int_str) 
         } else { 
-            format!("Interval: {}{} | +/- change | m mem-override | q quit | k kill | ←→ cmd | ↑↓ scroll | Sort: {}", int_str, cpu_mode, sort) 
+            format!("{}{}{} | +/- change | T tree | H threads | m mem-override | q quit | k kill | ←→ cmd | ↑↓ scroll", mode_tags, cpu_mode, int_str) 
         };
         
-        let left = if !self.kill_mode && !self.kill_confirming && self.cmd_offset > 0 { 
-            format!("{}  Cmd offset: {}", left, self.cmd_offset) 
-        } else { left };
-        let left = if !self.kill_mode && !self.kill_confirming && self.mem_override { 
-            format!("{} [MEM OVERRIDE]", left) 
-        } else { left };
+        let left = if self.cmd_offset > 0 { format!("{}  Cmd offset: {}", left, self.cmd_offset) } else { left };
+        let left = if self.mem_override { format!("{} [MEM OVERRIDE]", left) } else { left };
         
         let status = if left.len() + tot_text.len() + 1 <= self.term_width {
             format!("{}{}{}", left, " ".repeat(self.term_width - left.len() - tot_text.len() - 1), tot_text)
@@ -512,6 +667,7 @@ struct WorkerState {
 fn gather_data(
     do_mem: bool,
     use_nano_mode: bool,
+    thread_mode: bool,
     state: &mut WorkerState,
     user_map: &UserMap,
     clk_tck: u64,
@@ -539,6 +695,15 @@ fn gather_data(
                                  fields[12].parse::<u64>().unwrap_or(0))
                             } else { continue; }
                         } else { continue; };
+
+                        let status_path = format!("/proc/{}/status", pid);
+                        let status_content = fs::read_to_string(&status_path).ok().unwrap_or_default();
+                        
+                        let ppid = status_content.lines()
+                            .find(|l| l.starts_with("PPid:"))
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(1);
 
                         let mut use_nano_for_this_proc = use_nano_mode;
                         let mut runtime_ns = 0.0;
@@ -597,19 +762,20 @@ fn gather_data(
                         let (user, cmd, full_cmd) = if let Some(cached) = state.cached_static.get(&pid) {
                             cached.clone()
                         } else {
-                            let uid: u32 = fs::read_to_string(format!("/proc/{}/status", pid))
-                                .ok()
-                                .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok()))
-                                .unwrap_or(0);
+                            let uid = status_content.lines().find(|l| l.starts_with("Uid:"))
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
                             let user = user_map.get(&uid).cloned().unwrap_or_else(|| uid.to_string());
                             let full_cmd = fs::read_to_string(format!("/proc/{}/cmdline", pid))
                                 .unwrap_or_default().replace('\0', " ").trim().to_string();
                             let full_cmd = full_cmd.chars().take(2040).collect::<String>();
                             let cmd = full_cmd.chars().take(40).collect::<String>();
-                            let res = (user, cmd, full_cmd);
-                            state.cached_static.insert(pid, res.clone());
-                            res
+                            (user, cmd, full_cmd)
                         };
+
+                        let user_str = user.clone();
+                        let cmd_str = cmd.clone();
+                        let full_cmd_str = full_cmd.clone();
 
                         if rss_kb == 0 { continue; }
 
@@ -630,17 +796,56 @@ fn gather_data(
                         state.prev_cpu_times.insert(pid, (current_val, now));
 
                         procs.push(ProcInfo {
-                            pid, user, cmd, full_cmd, pss_kb, uss_kb, rss_kb, swap_kb,
-                            state: state_char, cpu_percent
+                            pid, tid: pid, ppid, user: user_str.clone(), cmd: cmd_str.clone(), full_cmd: full_cmd_str.clone(), 
+                            pss_kb, uss_kb, rss_kb, swap_kb, state: state_char, cpu_percent, is_thread: false, tree_indent: String::new()
                         });
+
+                        if thread_mode {
+                            let task_dir = format!("/proc/{}/task", pid);
+                            if let Ok(tasks) = fs::read_dir(&task_dir) {
+                                for task in tasks.flatten() {
+                                    if let Some(tid_str) = task.file_name().to_str() {
+                                        if let Ok(tid) = tid_str.parse::<i32>() {
+                                            if tid == pid { continue; }
+                                            let thread_sched = format!("{}/{}/schedstat", task_dir, tid);
+                                            let mut t_cpu = 0.0;
+                                            
+                                            if let Ok(content) = fs::read_to_string(&thread_sched) {
+                                                if let Some(ns_str) = content.split_whitespace().next() {
+                                                    if let Ok(ns) = ns_str.parse::<f64>() {
+                                                        let prev = state.prev_cpu_times.get(&tid).copied();
+                                                        if let Some((prev_val, prev_time)) = prev {
+                                                            let dt = now.duration_since(prev_time).as_secs_f64();
+                                                            let delta = ns - prev_val;
+                                                            if dt > 0.0 && delta >= 0.0 {
+                                                                t_cpu = (delta / 1_000_000_000.0 / dt / num_cpus as f64) * 100.0;
+                                                            }
+                                                        }
+                                                        state.prev_cpu_times.insert(tid, (ns, now));
+                                                    }
+                                                }
+                                            }
+                                            procs.push(ProcInfo {
+                                                pid, tid, ppid: pid,
+                                                user: user_str.clone(),
+                                                cmd: cmd_str.clone(),
+                                                full_cmd: format!("[thread {}] {}", tid, full_cmd_str),
+                                                pss_kb: 0, uss_kb: 0, rss_kb: 0, swap_kb: 0,
+                                                state: '?', cpu_percent: t_cpu, is_thread: true, tree_indent: String::new()
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
     
-    let active_pids: HashSet<i32> = procs.iter().map(|p| p.pid).collect();
-    state.prev_cpu_times.retain(|pid, _| active_pids.contains(pid));
+    let active_pids: HashSet<i32> = procs.iter().map(|p| if p.is_thread { p.tid } else { p.pid }).collect();
+    state.prev_cpu_times.retain(|id, _| active_pids.contains(id) || state.cached_static.contains_key(id));
     state.cached_static.retain(|pid, _| active_pids.contains(pid));
 
     let (total, idle) = read_cpu_times();
@@ -685,7 +890,7 @@ fn gather_data(
             'R' => run+=1, 'S'|'D' => slp+=1, 'Z' => zom+=1, _ => {}
         }
     }
-    let tasks = format!("{} ({} run, {} slp, {} zom)", procs.len(), run, slp, zom);
+    let tasks = format!("{} ({} run, {} slp, {} zom)", procs.iter().filter(|p| !p.is_thread).count(), run, slp, zom);
     
     let sys_info = SystemInfo { cpu_percent, mem_percent, swap_percent, load, uptime, tasks };
 
@@ -696,6 +901,7 @@ fn worker_loop(
     tx: mpsc::Sender<(Vec<ProcInfo>, SystemInfo)>,
     interval_shared: Arc<AtomicU64>,
     mem_override_shared: Arc<AtomicBool>,
+    thread_mode_shared: Arc<AtomicBool>,
     user_map: UserMap,
     clk_tck: u64,
     num_cpus: u64,
@@ -711,19 +917,21 @@ fn worker_loop(
 
     let priming_int = f64::from_bits(interval_shared.load(Ordering::Relaxed));
     let priming_nano = priming_int < 0.5;
-    let _ = gather_data(true, priming_nano, &mut state, &user_map, clk_tck, num_cpus);
+    let priming_thread = thread_mode_shared.load(Ordering::Relaxed);
+    let _ = gather_data(true, priming_nano, priming_thread, &mut state, &user_map, clk_tck, num_cpus);
     thread::sleep(Duration::from_millis(100));
 
     loop {
         let start = Instant::now();
         let int_sec = f64::from_bits(interval_shared.load(Ordering::Relaxed));
+        let thread_mode = thread_mode_shared.load(Ordering::Relaxed);
         
         let use_nano_mode = int_sec < 0.5; 
         
         if state.last_use_nano_mode != use_nano_mode {
             state.prev_cpu_times.clear();
             state.last_use_nano_mode = use_nano_mode;
-            let _ = gather_data(true, use_nano_mode, &mut state, &user_map, clk_tck, num_cpus);
+            let _ = gather_data(true, use_nano_mode, thread_mode, &mut state, &user_map, clk_tck, num_cpus);
             thread::sleep(Duration::from_millis(100));
         }
 
@@ -732,11 +940,11 @@ fn worker_loop(
             state.last_mem_update = Instant::now();
         }
 
-        let (procs, sys) = gather_data(do_mem, use_nano_mode, &mut state, &user_map, clk_tck, num_cpus);
+        let (procs, sys) = gather_data(do_mem, use_nano_mode, thread_mode, &mut state, &user_map, clk_tck, num_cpus);
         
         state.last_procs.clear();
         for p in &procs {
-            state.last_procs.insert(p.pid, p.clone());
+            state.last_procs.insert(if p.is_thread { p.tid } else { p.pid }, p.clone());
         }
 
         let _ = tx.send((procs, sys));
@@ -744,6 +952,7 @@ fn worker_loop(
         let elapsed = start.elapsed();
         let sleep_time = int_sec - elapsed.as_secs_f64();
         let start_mem_ov = mem_override_shared.load(Ordering::Relaxed);
+        let start_thread_mode = thread_mode_shared.load(Ordering::Relaxed);
         
         if sleep_time > 0.0 {
             let mut remaining = sleep_time;
@@ -753,8 +962,9 @@ fn worker_loop(
                 
                 let new_int = f64::from_bits(interval_shared.load(Ordering::Relaxed));
                 let new_mem_ov = mem_override_shared.load(Ordering::Relaxed);
+                let new_thread_mode = thread_mode_shared.load(Ordering::Relaxed);
                 
-                if new_int != int_sec || new_mem_ov != start_mem_ov {
+                if new_int != int_sec || new_mem_ov != start_mem_ov || new_thread_mode != start_thread_mode {
                     break;
                 }
                 remaining -= chunk;
@@ -785,6 +995,7 @@ fn main() -> io::Result<()> {
 
     let interval_shared = Arc::new(AtomicU64::new(interval.to_bits()));
     let mem_override_shared = Arc::new(AtomicBool::new(false));
+    let thread_mode_shared = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
 
     let user_map = build_user_map();
@@ -794,9 +1005,10 @@ fn main() -> io::Result<()> {
     thread::spawn({
         let interval_shared = Arc::clone(&interval_shared);
         let mem_override_shared = Arc::clone(&mem_override_shared);
+        let thread_mode_shared = Arc::clone(&thread_mode_shared);
         let user_map = user_map.clone();
         move || {
-            worker_loop(tx, interval_shared, mem_override_shared, user_map, clk_tck, num_cpus);
+            worker_loop(tx, interval_shared, mem_override_shared, thread_mode_shared, user_map, clk_tck, num_cpus);
         }
     });
 
@@ -818,7 +1030,6 @@ fn main() -> io::Result<()> {
                 if !event::poll(Duration::ZERO)? { break; }
             }
             for key in keys {
-                // ── KILL CONFIRMATION MODE ──
                 if app.kill_confirming {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -841,7 +1052,6 @@ fn main() -> io::Result<()> {
                     continue;
                 }
 
-                // ── KILL SELECTION MODE ──
                 if app.kill_mode {
                     match key.code {
                         KeyCode::Esc => {
@@ -863,7 +1073,11 @@ fn main() -> io::Result<()> {
                         }
                         KeyCode::Char(' ') => {
                             if app.kill_selected < app.filtered_raw.len() {
-                                let pid = app.filtered_raw[app.kill_selected].pid;
+                                let pid = if app.filtered_raw[app.kill_selected].is_thread { 
+                                    app.filtered_raw[app.kill_selected].tid 
+                                } else { 
+                                    app.filtered_raw[app.kill_selected].pid 
+                                };
                                 if app.marked_pids.contains(&pid) {
                                     app.marked_pids.remove(&pid);
                                 } else {
@@ -884,7 +1098,6 @@ fn main() -> io::Result<()> {
                     }
                 }
 
-                // ── SEARCH MODE ──
                 if app.searching {
                     match key.code {
                         KeyCode::Esc => { app.filter_string.clear(); app.searching=false; ui_dirty = true; continue; }
@@ -895,7 +1108,6 @@ fn main() -> io::Result<()> {
                     }
                 }
 
-                // ── NORMAL MODE ──
                 match key.code {
                     KeyCode::Char('q')|KeyCode::Char('Q') => break 'outer,
                     KeyCode::Char('/') => { app.searching=true; ui_dirty = true; continue; }
@@ -907,6 +1119,18 @@ fn main() -> io::Result<()> {
                             app.kill_confirming = false;
                             ui_dirty = true;
                         }
+                        continue;
+                    }
+                    KeyCode::Char('t')|KeyCode::Char('T') => { 
+                        app.tree_mode = !app.tree_mode; 
+                        if app.tree_mode { app.collapsed_pids.clear(); }
+                        ui_dirty = true; 
+                        continue;
+                    }
+                    KeyCode::Char('h')|KeyCode::Char('H') => { 
+                        app.thread_mode = !app.thread_mode; 
+                        thread_mode_shared.store(app.thread_mode, Ordering::Relaxed);
+                        ui_dirty = true; 
                         continue;
                     }
                     KeyCode::Char('m')|KeyCode::Char('M') => { 
@@ -921,8 +1145,8 @@ fn main() -> io::Result<()> {
                         let max = if app.data_rows.len()>vis { app.data_rows.len()-vis } else { 0 };
                         app.scroll_pos = (app.scroll_pos+5).min(max); ui_dirty = true;
                     }
-                    KeyCode::Left => { app.cmd_offset = app.cmd_offset.saturating_sub(40); app.soft_update(); ui_dirty = true; continue; }
-                    KeyCode::Right => { app.cmd_offset = (app.cmd_offset+40).min(2000); app.soft_update(); ui_dirty = true; continue; }
+                    KeyCode::Left => { app.cmd_offset = app.cmd_offset.saturating_sub(40); app.apply_filter_and_sort(); app.compute_widths(); ui_dirty = true; continue; }
+                    KeyCode::Right => { app.cmd_offset = (app.cmd_offset+40).min(2000); app.apply_filter_and_sort(); app.compute_widths(); ui_dirty = true; continue; }
                     KeyCode::Char('+')|KeyCode::Char('=') => {
                         if let Some(pos) = intervals.iter().position(|&v| v==app.interval) {
                             if pos < intervals.len()-1 { 
@@ -947,7 +1171,7 @@ fn main() -> io::Result<()> {
                             let col = n-1;
                             if col == app.sort_col { app.sort_reverse = !app.sort_reverse; }
                             else { app.sort_col = col; app.sort_reverse = col>2; }
-                            app.soft_update(); app.scroll_pos=0; ui_dirty = true;
+                            ui_dirty = true;
                         }
                     }
                     _ => {}
