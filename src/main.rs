@@ -237,7 +237,9 @@ struct App {
     mem_total_bytes: u64, limit_red_bytes: u64, swap_total_bytes: u64,
     raw_data: Vec<ProcInfo>, filtered_raw: Vec<ProcInfo>, data_rows: Vec<Vec<String>>,
     widths: Vec<usize>, sort_col: usize, sort_reverse: bool,
-    filter_string: String, searching: bool, killing: bool, kill_pid_str: String, cmd_offset: usize,
+    filter_string: String, searching: bool, 
+    kill_mode: bool, kill_selected: usize, marked_pids: HashSet<i32>, kill_confirming: bool,
+    cmd_offset: usize,
     system_info: SystemInfo,
     scroll_pos: usize, mem_override: bool,
 }
@@ -264,8 +266,9 @@ impl App {
             mem_total_bytes, limit_red_bytes, swap_total_bytes,
             raw_data: vec![], filtered_raw: vec![], data_rows: vec![],
             widths: vec![0;8], sort_col: 3, sort_reverse: true,
-            filter_string: String::new(), searching: false, killing: false,
-            kill_pid_str: String::new(), cmd_offset: 0,
+            filter_string: String::new(), searching: false,
+            kill_mode: false, kill_selected: 0, marked_pids: HashSet::new(), kill_confirming: false,
+            cmd_offset: 0,
             system_info: SystemInfo::default(), scroll_pos: 0,
             mem_override: false,
         }
@@ -330,9 +333,12 @@ impl App {
         }
     }
 
-    fn build_header_line(&self) -> String {
+    fn build_header_line(&self, kill_mode: bool) -> String {
         let headers = ["1 PID","2 User","3 Command","4 PSS","5 USS","6 RSS","7 Swap","8 CPU%"];
-        let positions: [usize; 8] = [1,8,24,69,79,89,98,105];
+        let mut positions: [usize; 8] = [1,8,24,69,79,89,98,105];
+        if kill_mode {
+            for p in &mut positions { *p += 4; }
+        }
         let mut line = String::new(); let mut col = 0;
         for (i, label) in headers.iter().enumerate() {
             let pos = positions[i];
@@ -395,7 +401,7 @@ impl App {
         self.scroll_pos = self.scroll_pos.min(max_scroll);
 
         let sys = self.build_system_line();
-        let header = self.build_header_line();
+        let header = self.build_header_line(self.kill_mode);
         let gaps = [2,1,2,2,2,2,2];
         let aligns = ["right","left","left","right","right","right","right","right"];
         let track = ansi_bg_rgb(40,40,40); let thumb = ansi_bg_rgb(120,120,120); let rst = ansi_reset();
@@ -413,6 +419,23 @@ impl App {
                     .map(|(i,c)| Self::pad_cell(c, self.widths[i], aligns[i])).collect();
                 let mut line = String::new();
                 for (i,c) in cells.iter().enumerate() { line.push_str(c); if i<gaps.len() { line.push_str(&" ".repeat(gaps[i])); } }
+                
+                if self.kill_mode && didx < self.filtered_raw.len() {
+                    let pid = self.filtered_raw[didx].pid;
+                    let is_marked = self.marked_pids.contains(&pid);
+                    let is_selected = didx == self.kill_selected;
+                    let marker = if is_selected && is_marked { "[*] " }
+                                 else if is_marked { "[x] " }
+                                 else if is_selected { "[ ] " }
+                                 else { "    " };
+                    
+                    if is_selected {
+                        line = format!("\x1b[7m{}{}\x1b[27m", marker, line);
+                    } else {
+                        line = format!("{}{}", marker, line);
+                    }
+                }
+
                 let maxw = self.term_width.saturating_sub(2);
                 let v = visible_len(&line); if v < maxw { line.push_str(&" ".repeat(maxw-v)); }
                 line
@@ -436,13 +459,25 @@ impl App {
         
         let cpu_mode = if self.interval < 0.5 { " [NANO CPU]" } else { "" };
         
-        let left = if self.killing { format!("Kill PID: {}_ (Enter to confirm, Esc to cancel)", self.kill_pid_str) }
-        else if self.searching { format!("Search: {}_ (Enter to accept, Esc to clear)", self.filter_string) }
-        else if !self.filter_string.is_empty() { format!("Filter: '{}' | {} | Interval: {}{} | / search", self.filter_string, sort, int_str, cpu_mode) }
-        else { format!("Interval: {}{} | +/- change | m mem-override | q quit | k kill | ←→ cmd | ↑↓ scroll | Sort: {}", int_str, cpu_mode, sort) };
+        let left = if self.kill_confirming {
+            format!("Kill {} marked process(es)? Are you sure? y/n", self.marked_pids.len())
+        } else if self.kill_mode {
+            let marked_count = self.marked_pids.len();
+            format!("KILL MODE: ↑↓ select | Space mark | Enter confirm | Esc cancel | Marked: {}", marked_count)
+        } else if self.searching { 
+            format!("Search: {}_ (Enter to accept, Esc to clear)", self.filter_string) 
+        } else if !self.filter_string.is_empty() { 
+            format!("Filter: '{}' | {} | Interval: {}{} | / search", self.filter_string, sort, int_str, cpu_mode) 
+        } else { 
+            format!("Interval: {}{} | +/- change | m mem-override | q quit | k kill | ←→ cmd | ↑↓ scroll | Sort: {}", int_str, cpu_mode, sort) 
+        };
         
-        let left = if self.cmd_offset > 0 { format!("{}  Cmd offset: {}", left, self.cmd_offset) } else { left };
-        let left = if self.mem_override { format!("{} [MEM OVERRIDE]", left) } else { left };
+        let left = if !self.kill_mode && !self.kill_confirming && self.cmd_offset > 0 { 
+            format!("{}  Cmd offset: {}", left, self.cmd_offset) 
+        } else { left };
+        let left = if !self.kill_mode && !self.kill_confirming && self.mem_override { 
+            format!("{} [MEM OVERRIDE]", left) 
+        } else { left };
         
         let status = if left.len() + tot_text.len() + 1 <= self.term_width {
             format!("{}{}{}", left, " ".repeat(self.term_width - left.len() - tot_text.len() - 1), tot_text)
@@ -450,8 +485,12 @@ impl App {
             let trunc: String = left.chars().take(self.term_width.saturating_sub(tot_text.len()+1)).collect();
             format!("{} {}", trunc, tot_text)
         };
+        let status_bg = if self.kill_confirming { ansi_bg_rgb(180, 40, 40) } 
+                        else if self.kill_mode { ansi_bg_rgb(40, 60, 100) } 
+                        else if self.searching { ansi_bg_rgb(80, 100, 40) }
+                        else { ansi_bg_rgb(60,60,60) };
         let status_line = if self.no_color { format!("{: <width$}", status, width=self.term_width) }
-        else { format!("{}{}{}{}", ansi_bg_rgb(60,60,60), ansi_fg_rgb(255,255,255), format!("{: <width$}", status, width=self.term_width), rst) };
+        else { format!("{}{}{}{}", status_bg, ansi_fg_rgb(255,255,255), format!("{: <width$}", status, width=self.term_width), rst) };
         
         write!(out, "{}", status_line)?;
         execute!(out, terminal::Clear(ClearType::FromCursorDown))?;
@@ -501,7 +540,6 @@ fn gather_data(
                             } else { continue; }
                         } else { continue; };
 
-                        // NANOSECOND PRECISION MODE (Thread-Aggregated)
                         let mut use_nano_for_this_proc = use_nano_mode;
                         let mut runtime_ns = 0.0;
                         
@@ -671,11 +709,10 @@ fn worker_loop(
         last_use_nano_mode: false,
     };
 
-    // FIX 2: Prime the CPU cache so the very first frame has accurate CPU %
     let priming_int = f64::from_bits(interval_shared.load(Ordering::Relaxed));
     let priming_nano = priming_int < 0.5;
     let _ = gather_data(true, priming_nano, &mut state, &user_map, clk_tck, num_cpus);
-    thread::sleep(Duration::from_millis(100)); // Wait 100ms to accumulate a delta
+    thread::sleep(Duration::from_millis(100));
 
     loop {
         let start = Instant::now();
@@ -686,7 +723,6 @@ fn worker_loop(
         if state.last_use_nano_mode != use_nano_mode {
             state.prev_cpu_times.clear();
             state.last_use_nano_mode = use_nano_mode;
-            // Re-prime if mode switched to avoid massive delta spikes
             let _ = gather_data(true, use_nano_mode, &mut state, &user_map, clk_tck, num_cpus);
             thread::sleep(Duration::from_millis(100));
         }
@@ -709,18 +745,17 @@ fn worker_loop(
         let sleep_time = int_sec - elapsed.as_secs_f64();
         let start_mem_ov = mem_override_shared.load(Ordering::Relaxed);
         
-        // FIX 1: Interruptible sleep to immediately react to interval/setting changes
         if sleep_time > 0.0 {
             let mut remaining = sleep_time;
             while remaining > 0.0 {
-                let chunk = remaining.min(0.05); // Check every 50ms
+                let chunk = remaining.min(0.05);
                 thread::sleep(Duration::from_secs_f64(chunk));
                 
                 let new_int = f64::from_bits(interval_shared.load(Ordering::Relaxed));
                 let new_mem_ov = mem_override_shared.load(Ordering::Relaxed);
                 
                 if new_int != int_sec || new_mem_ov != start_mem_ov {
-                    break; // Wake up immediately on settings change
+                    break;
                 }
                 remaining -= chunk;
             }
@@ -783,20 +818,73 @@ fn main() -> io::Result<()> {
                 if !event::poll(Duration::ZERO)? { break; }
             }
             for key in keys {
-                if app.killing {
+                // ── KILL CONFIRMATION MODE ──
+                if app.kill_confirming {
                     match key.code {
-                        KeyCode::Esc => { app.killing=false; app.kill_pid_str.clear(); ui_dirty = true; continue; }
-                        KeyCode::Enter => {
-                            if !app.kill_pid_str.is_empty() && app.kill_pid_str.chars().all(|c| c.is_ascii_digit()) {
-                                if let Ok(pid) = app.kill_pid_str.parse::<i32>() { unsafe { libc::kill(pid, libc::SIGTERM); } }
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            for &pid in &app.marked_pids {
+                                unsafe { libc::kill(pid, libc::SIGTERM); }
                             }
-                            app.killing=false; app.kill_pid_str.clear(); ui_dirty = true; continue;
+                            app.marked_pids.clear();
+                            app.kill_mode = false;
+                            app.kill_confirming = false;
+                            ui_dirty = true;
                         }
-                        KeyCode::Backspace|KeyCode::Delete => { app.kill_pid_str.pop(); ui_dirty = true; continue; }
-                        KeyCode::Char(c) if c.is_ascii_digit() => { app.kill_pid_str.push(c); ui_dirty = true; continue; }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            app.kill_confirming = false;
+                            app.kill_mode = false;
+                            app.marked_pids.clear();
+                            ui_dirty = true;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // ── KILL SELECTION MODE ──
+                if app.kill_mode {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.kill_mode = false;
+                            app.marked_pids.clear();
+                            ui_dirty = true;
+                            continue;
+                        }
+                        KeyCode::Up => {
+                            app.kill_selected = app.kill_selected.saturating_sub(1);
+                            ui_dirty = true;
+                            continue;
+                        }
+                        KeyCode::Down => {
+                            let max_idx = app.filtered_raw.len().saturating_sub(1);
+                            app.kill_selected = (app.kill_selected + 1).min(max_idx);
+                            ui_dirty = true;
+                            continue;
+                        }
+                        KeyCode::Char(' ') => {
+                            if app.kill_selected < app.filtered_raw.len() {
+                                let pid = app.filtered_raw[app.kill_selected].pid;
+                                if app.marked_pids.contains(&pid) {
+                                    app.marked_pids.remove(&pid);
+                                } else {
+                                    app.marked_pids.insert(pid);
+                                }
+                                ui_dirty = true;
+                            }
+                            continue;
+                        }
+                        KeyCode::Enter => {
+                            if !app.marked_pids.is_empty() {
+                                app.kill_confirming = true;
+                                ui_dirty = true;
+                            }
+                            continue;
+                        }
                         _ => continue,
                     }
                 }
+
+                // ── SEARCH MODE ──
                 if app.searching {
                     match key.code {
                         KeyCode::Esc => { app.filter_string.clear(); app.searching=false; ui_dirty = true; continue; }
@@ -806,10 +894,21 @@ fn main() -> io::Result<()> {
                         _ => continue,
                     }
                 }
+
+                // ── NORMAL MODE ──
                 match key.code {
                     KeyCode::Char('q')|KeyCode::Char('Q') => break 'outer,
                     KeyCode::Char('/') => { app.searching=true; ui_dirty = true; continue; }
-                    KeyCode::Char('k')|KeyCode::Char('K') => { app.killing=true; app.kill_pid_str.clear(); ui_dirty = true; continue; }
+                    KeyCode::Char('k')|KeyCode::Char('K') => {
+                        if !app.filtered_raw.is_empty() {
+                            app.kill_mode = true;
+                            app.kill_selected = 0;
+                            app.marked_pids.clear();
+                            app.kill_confirming = false;
+                            ui_dirty = true;
+                        }
+                        continue;
+                    }
                     KeyCode::Char('m')|KeyCode::Char('M') => { 
                         app.mem_override = !app.mem_override; 
                         mem_override_shared.store(app.mem_override, Ordering::Relaxed); 
@@ -862,11 +961,10 @@ fn main() -> io::Result<()> {
             got_new_data = true;
         }
 
-        // Freeze the process list data when in kill mode so rows don't jump around
-        let data_frozen = app.killing;
+        let data_frozen = app.kill_mode || app.kill_confirming;
         let update_data = got_new_data && !data_frozen;
 
-        let render_interval = if app.searching || app.killing { 0.1 } else { app.interval };
+        let render_interval = if app.searching || app.kill_mode || app.kill_confirming { 0.1 } else { app.interval };
         let time_since_render = last_render.elapsed().as_secs_f64();
         
         if update_data || ui_dirty || time_since_render >= render_interval {
@@ -876,6 +974,16 @@ fn main() -> io::Result<()> {
             }
             app.apply_filter_and_sort();
             app.compute_widths();
+            
+            if app.kill_mode && !app.filtered_raw.is_empty() {
+                app.kill_selected = app.kill_selected.min(app.filtered_raw.len() - 1);
+                let visible = app.term_height.saturating_sub(3);
+                if app.kill_selected < app.scroll_pos {
+                    app.scroll_pos = app.kill_selected;
+                } else if app.kill_selected >= app.scroll_pos + visible {
+                    app.scroll_pos = app.kill_selected.saturating_sub(visible) + 1;
+                }
+            }
             
             let vis = app.term_height.saturating_sub(3);
             let max = if app.data_rows.len() > vis { app.data_rows.len() - vis } else { 0 };
