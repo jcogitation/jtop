@@ -1,7 +1,10 @@
 [package]
-name = "jtop"
-version = "0.5-beta"
+name = "jtop-pss"
+version = "0.5.0-beta"
 edition = "2021"
+description = "High-performance PSS/USS-aware system monitor top/htop replacement in Rust. Features true-color TUI, nanosecond-accurate CPU tracking, and bulk process management."
+license = "MIT"
+repository = "https://github.com/jcogitation/jtop"
 
 [dependencies]
 crossterm = "0.27"
@@ -13,3 +16,7 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "unwind"
+
+[[bin]]
+name = "jtop"
+path = "src/main.rs"

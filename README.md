@@ -1,9 +1,33 @@
-# jtop – PSS/USS-aware process monitor with true-color TUI
+# jtop – PSS/USS-aware process monitor with true-color TUI in Rust
 
-**jtop** is a terminal process viewer focused on two things: 1. Showing the memory your processes actually use. top, htop, even btop and system monitor show Resident Set Size, a calculation for RAM which can greatly overcount (by 20x or more in worst-case) RAM usage by counting shared memory more than once. top/htop/btop/system monitor show RSS. jtop shows **PSS** (Proportional Set Size) and **USS** (Unique Set Size) RAM totals. PSS counts divides shared memory by all processes using it, giving an accurate representation of the amount of RAM a given process actually uses. 2. It measures CPU usage by wall-clock delta with nanosecond‑accurate values from /proc/<pid>/task/<tid>/schedstat for intervals under 0.5 s, preserving accuracy.  
+[![Build Status](https://github.com/jcogitation/jtop/actions/workflows/rust.yml/badge.svg)](https://github.com/jcogitation/jtop/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Crates.io](https://img.shields.io/crates/v/jtop-pss.svg)](https://crates.io/crates/jtop-pss)
+
+**jtop** is a terminal process viewer focused on two things: 
+
+1. Showing the memory your processes actually use. top, htop, even btop and system monitor show Resident Set Size, a calculation for RAM which can greatly overcount (by 20x or more in worst-case) RAM usage by counting shared memory more than once. top/htop/btop/system monitor show RSS. jtop shows **PSS** (Proportional Set Size) and **USS** (Unique Set Size) RAM totals. PSS counts divides shared memory by all processes using it, giving an accurate representation of the amount of RAM a given process actually uses. 
+
+2. It measures CPU usage by wall-clock delta with nanosecond‑accurate values from /proc/<pid>/task/<tid>/schedstat for intervals under 0.5 s, preserving accuracy.  
+
 Originally written to compare window‑manager memory footprints, it has grown into a usable `htop` replacement with fast filtering, bulk kill, tree view, thread view, and a readable true‑color interface. It doesn't have the same features as htop yet, but has everything that mattered to me. 
 
 ---
+
+## Screenshots
+
+### Main View (Default, sorted by PSS RAM usage descending)
+![jtop main view](assets/jtop_PSS_Sorted.webp)
+
+### Filtered View (Brave Browser Processes)
+![jtop filtered view](assets/jtop_filter_brave.webp)
+
+### Kill Mode (End all snapd threads)
+![jtop kill mode](assets/jtop_kill_mode.webp)
+
+### All Features On (Tree, Threads, Kernel commands, Mem-override, 0.05s interval)
+![jtop all features](assets/jtop_allfeatureson.webp)
+
 
 ## Features
 
@@ -84,7 +108,7 @@ jtop [-i seconds] [--no-color]
 |-------------------|----------------------------------------------------------------------------------------------------------------------------------|
 | `-i`, `--interval`| Update interval in seconds. If not one of the allowed values (see above), it snaps to the nearest allowed value. Default: `2.0`. |
 | `--no-color`      | Disable all 24‑bit color output (plain text).                                                                                    |
-|-------------------|----------------------------------------------------------------------------------------------------------------------------------|
+
 
 ### Interactive keybindings
 
@@ -109,7 +133,7 @@ jtop [-i seconds] [--no-color]
 | `Space`      | Mark/unmark the highlighted process/thread and advance to the next            |
 | `Enter`      | Confirm kill of all marked entries (prompts y/n)                              |
 | `Esc`        | Exit kill mode without killing                                                |
-|--------------|-------------------------------------------------------------------------------|
+
 
 *Tip:* while filtering for a specific program (e.g. `brave`), press `F9`, then hold Space to rapidly mark all visible entries. Press Enter, then `y` to kill them all.
 
