@@ -230,7 +230,7 @@ struct App {
     term_width: usize, term_height: usize, interval: f64, no_color: bool,
     current_user: String,
     mem_total_bytes: u64, limit_red_bytes: u64, swap_total_bytes: u64,
-    raw_data: Vec<ProcInfo>, filtered_raw: Vec<ProcInfo>, data_rows: Vec<Vec<String>>,
+    raw_data: Vec<ProcInfo>, filtered_raw: Vec<ProcInfo>,
     widths: Vec<usize>, sort_col: usize, sort_reverse: bool,
     filter_string: String, searching: bool, 
     kill_mode: bool, kill_selected: usize, marked_pids: HashSet<i32>, kill_confirming: bool,
@@ -260,7 +260,7 @@ impl App {
             term_width: w as usize, term_height: h as usize,
             interval, no_color, current_user,
             mem_total_bytes, limit_red_bytes, swap_total_bytes,
-            raw_data: vec![], filtered_raw: vec![], data_rows: vec![],
+            raw_data: vec![], filtered_raw: vec![],
             widths: vec![0;8], sort_col: 3, sort_reverse: true,
             filter_string: String::new(), searching: false,
             kill_mode: false, kill_selected: 0, marked_pids: HashSet::new(), kill_confirming: false,
@@ -295,8 +295,8 @@ impl App {
             self.filtered_raw = self.raw_data.clone();
             match self.sort_col {
                 0 => self.filtered_raw.sort_by_key(|p| p.pid),
-                1 => self.filtered_raw.sort_by(|a, b| a.user.to_lowercase().cmp(&b.user.to_lowercase())),
-                2 => self.filtered_raw.sort_by(|a, b| a.cmd.to_lowercase().cmp(&b.cmd.to_lowercase())),
+                1 => self.filtered_raw.sort_by(|a, b| a.user.chars().map(|c| c.to_ascii_lowercase()).cmp(b.user.chars().map(|c| c.to_ascii_lowercase()))),
+                2 => self.filtered_raw.sort_by(|a, b| a.cmd.chars().map(|c| c.to_ascii_lowercase()).cmp(b.cmd.chars().map(|c| c.to_ascii_lowercase()))),
                 3 => self.filtered_raw.sort_by_key(|p| p.pss_kb),
                 4 => self.filtered_raw.sort_by_key(|p| p.uss_kb),
                 5 => self.filtered_raw.sort_by_key(|p| p.rss_kb),
@@ -318,8 +318,8 @@ impl App {
             
             match self.sort_col {
                 0 => self.filtered_raw.sort_by_key(|p| p.pid),
-                1 => self.filtered_raw.sort_by(|a, b| a.user.to_lowercase().cmp(&b.user.to_lowercase())),
-                2 => self.filtered_raw.sort_by(|a, b| a.cmd.to_lowercase().cmp(&b.cmd.to_lowercase())),
+                1 => self.filtered_raw.sort_by(|a, b| a.user.chars().map(|c| c.to_ascii_lowercase()).cmp(b.user.chars().map(|c| c.to_ascii_lowercase()))),
+                2 => self.filtered_raw.sort_by(|a, b| a.cmd.chars().map(|c| c.to_ascii_lowercase()).cmp(b.cmd.chars().map(|c| c.to_ascii_lowercase()))),
                 3 => self.filtered_raw.sort_by_key(|p| p.pss_kb),
                 4 => self.filtered_raw.sort_by_key(|p| p.uss_kb),
                 5 => self.filtered_raw.sort_by_key(|p| p.rss_kb),
@@ -441,7 +441,6 @@ impl App {
 
             self.filtered_raw = result;
         }
-        self.data_rows = self.filtered_raw.iter().map(|p| self.format_row(p)).collect();
     }
 
     fn format_row(&self, p: &ProcInfo) -> Vec<String> {
@@ -527,33 +526,68 @@ impl App {
 
     fn compute_widths(&mut self) {
         let headers = ["1 PID","2 User","3 Command/Program","4 PSS","5 USS","6 RSS","7 Swap","8 CPU%"];
-        self.widths = headers.iter().map(|h| visible_len(h)).collect::<Vec<_>>();
-        for row in &self.data_rows {
-            for (i, cell) in row.iter().enumerate() {
-                let v = visible_len(cell);
-                if v > self.widths[i] { self.widths[i] = v; }
-            }
+        self.widths = headers.iter().map(|h| h.chars().count()).collect::<Vec<_>>();
+        
+        for p in &self.filtered_raw {
+            let pid_len = if p.is_thread { p.tid.to_string().len() } else { p.pid.to_string().len() };
+            self.widths[0] = self.widths[0].max(pid_len);
+            
+            self.widths[1] = self.widths[1].max(p.user.chars().count());
+            
+            let indent_len = if self.tree_mode && p.tree_depth > 0 { p.tree_depth as usize * 3 + 2 } else { 0 };
+            let chars_count = p.full_cmd.chars().count();
+            let max_offset = chars_count.saturating_sub(40);
+            let offset = self.cmd_offset.min(max_offset);
+            let displayed_len = p.full_cmd.chars().skip(offset).take(40).count();
+            // Account for the manual padding in format_row
+            self.widths[2] = self.widths[2].max(indent_len + displayed_len.max(40));
+            
+            self.widths[3] = self.widths[3].max(format_memory(p.pss_kb, p.is_thread).len());
+            self.widths[4] = self.widths[4].max(format_memory(p.uss_kb, p.is_thread).len());
+            self.widths[5] = self.widths[5].max(format_memory(p.rss_kb, p.is_thread).len());
+            self.widths[6] = self.widths[6].max(format_memory(p.swap_kb, p.is_thread).len());
+            self.widths[7] = self.widths[7].max(format!("{:5.1}", p.cpu_percent).len());
         }
     }
 
     fn build_header_line(&self) -> String {
         let headers = ["1 PID","2 User","3 Command/Program","4 PSS","5 USS","6 RSS","7 Swap","8 CPU%"];
-        let positions: [usize; 8] = [1, 8, 24, 78, 88, 98, 107, 114];
-        let mut line = String::new(); let mut col = 0;
+        let gaps = [2, 1, 2, 2, 2, 2, 2];
+        let aligns = ["right", "left", "left", "right", "right", "right", "right", "right"];
+        
+        let mut line = String::new();
         for (i, label) in headers.iter().enumerate() {
-            let pos = positions[i];
-            let spaces = pos.saturating_sub(col);
-            line.push_str(&" ".repeat(spaces));
+            let width = self.widths[i];
+            let label_len = label.chars().count();
+            let pad = width.saturating_sub(label_len);
+            
+            let (left_pad, right_pad) = if aligns[i] == "right" {
+                (pad, 0)
+            } else {
+                (0, pad)
+            };
+            
+            line.push_str(&" ".repeat(left_pad));
+            
             let fmt = if i == self.sort_col && !self.no_color {
                 bold_color_rgb(CYAN_BRIGHT.0, CYAN_BRIGHT.1, CYAN_BRIGHT.2, label)
             } else if !self.no_color {
-                bold_color_rgb(255,255,255, label)
-            } else { bold_text(label) };
+                bold_color_rgb(255, 255, 255, label)
+            } else { 
+                bold_text(label) 
+            };
+            
             line.push_str(&fmt);
-            col = pos + label.len();
+            line.push_str(&" ".repeat(right_pad));
+            
+            if i < gaps.len() {
+                line.push_str(&" ".repeat(gaps[i]));
+            }
         }
+        
         let max = self.term_width.saturating_sub(2);
-        if col < max { line.push_str(&" ".repeat(max - col)); }
+        let vis_len = visible_len(&line);
+        if vis_len < max { line.push_str(&" ".repeat(max - vis_len)); }
         line.push_str(&format!("{}\x1b[0m  ", ansi_bg_rgb(40,40,40)));
         line
     }
@@ -595,7 +629,7 @@ impl App {
     }
 
     fn render(&mut self) -> io::Result<()> {
-        let total = self.data_rows.len();
+        let total = self.filtered_raw.len();
         let visible = self.term_height.saturating_sub(3);
         let max_scroll = if total > visible { total - visible } else { 0 };
         self.scroll_pos = self.scroll_pos.min(max_scroll);
@@ -615,7 +649,8 @@ impl App {
         for idx in 0..visible {
             let didx = self.scroll_pos + idx;
             let row = if didx < total {
-                let cells: Vec<String> = self.data_rows[didx].iter().enumerate()
+                let formatted_row = self.format_row(&self.filtered_raw[didx]);
+                let cells: Vec<String> = formatted_row.iter().enumerate()
                     .map(|(i,c)| Self::pad_cell(c, self.widths[i], aligns[i])).collect();
                 let mut line = String::new();
                 for (i,c) in cells.iter().enumerate() { line.push_str(c); if i<gaps.len() { line.push_str(&" ".repeat(gaps[i])); } }
@@ -1205,7 +1240,7 @@ fn main() -> io::Result<()> {
                     KeyCode::Up => { app.scroll_pos = app.scroll_pos.saturating_sub(5); ui_dirty = true; }
                     KeyCode::Down => {
                         let vis = app.term_height.saturating_sub(3);
-                        let max = if app.data_rows.len()>vis { app.data_rows.len()-vis } else { 0 };
+                        let max = if app.filtered_raw.len()>vis { app.filtered_raw.len()-vis } else { 0 };
                         app.scroll_pos = (app.scroll_pos+5).min(max); ui_dirty = true;
                     }
                     KeyCode::Left => { app.cmd_offset = app.cmd_offset.saturating_sub(40); app.apply_filter_and_sort(); app.compute_widths(); ui_dirty = true; continue; }
@@ -1273,7 +1308,7 @@ fn main() -> io::Result<()> {
             }
             
             let vis = app.term_height.saturating_sub(3);
-            let max = if app.data_rows.len() > vis { app.data_rows.len() - vis } else { 0 };
+            let max = if app.filtered_raw.len() > vis { app.filtered_raw.len() - vis } else { 0 };
             app.scroll_pos = app.scroll_pos.min(max);
             if app.searching { app.scroll_pos = 0; }
             
