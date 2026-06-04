@@ -141,10 +141,106 @@ fn visible_len(s: &str) -> usize {
     len
 }
 
-// ── Direct /proc parsers ──────────────────────────────────────────────
-fn read_meminfo() -> HashMap<String, u64> {
+// ── Raw /proc file reading helpers ─────────────────────────────────────
+const PROC_BUF_SIZE: usize = 65536; // large enough for any /proc file (e.g., smaps_rollup)
+
+/// Write a positive i32 as decimal digits into buf, returns number of bytes written.
+fn write_i32(mut n: i32, buf: &mut [u8]) -> usize {
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut len = 0;
+    // write digits in reverse (least significant first)
+    while n > 0 {
+        buf[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+    }
+    // reverse in-place
+    let (mut a, mut b) = (0, len - 1);
+    while a < b {
+        buf.swap(a, b);
+        a += 1;
+        b -= 1;
+    }
+    len
+}
+
+/// Read a whole file into `buf` using raw open/read/close. Returns slice of valid bytes.
+unsafe fn proc_read_raw(path: *const libc::c_char, buf: &mut [u8]) -> io::Result<&[u8]> {
+    let fd = libc::open(path, libc::O_RDONLY);
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let n = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+    let err = if n < 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    libc::close(fd);
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(&buf[..n as usize])
+}
+
+/// Convenience: read a proc file into a string slice (assumes ASCII content).
+fn proc_read_str(path: *const libc::c_char, buf: &mut [u8]) -> io::Result<&str> {
+    let bytes = unsafe { proc_read_raw(path, buf)? };
+    // All /proc files are ASCII, so this is safe
+    Ok(unsafe { std::str::from_utf8_unchecked(bytes) })
+}
+
+/// Write a null-terminated path like /proc/12345/stat into `buf`.
+/// Returns a C string pointer.
+fn build_proc_path(pid: i32, suffix: &str, buf: &mut [u8]) -> *const libc::c_char {
+    let mut pos = 0;
+    let prefix = b"/proc/";
+    buf[pos..pos + prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+    pos += write_i32(pid, &mut buf[pos..]);
+
+    let suffix_bytes = suffix.as_bytes();
+    buf[pos..pos + suffix_bytes.len()].copy_from_slice(suffix_bytes);
+    pos += suffix_bytes.len();
+    buf[pos] = 0;
+    buf.as_ptr() as *const libc::c_char
+}
+
+/// Two-level path: /proc/{pid}/task/{tid}/{suffix} directly on stack
+fn build_task_path(pid: i32, tid: i32, suffix: &str, buf: &mut [u8]) -> *const libc::c_char {
+    let mut pos = 0;
+    let prefix = b"/proc/";
+    buf[pos..pos + prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+
+    pos += write_i32(pid, &mut buf[pos..]);
+
+    let mid = b"/task/";
+    buf[pos..pos + mid.len()].copy_from_slice(mid);
+    pos += mid.len();
+
+    pos += write_i32(tid, &mut buf[pos..]);
+
+    let slash = b'/';
+    buf[pos] = slash;
+    pos += 1;
+
+    let suffix_bytes = suffix.as_bytes();
+    buf[pos..pos + suffix_bytes.len()].copy_from_slice(suffix_bytes);
+    pos += suffix_bytes.len();
+    buf[pos] = 0;
+    buf.as_ptr() as *const libc::c_char
+}
+
+// ── Direct /proc parsers (now use reusable buffers) ───────────────────
+fn read_meminfo_buf(buf: &mut [u8]) -> HashMap<String, u64> {
     let mut map = HashMap::new();
-    if let Ok(content) = fs::read_to_string("/proc/meminfo") {
+    let path = b"/proc/meminfo\0";
+    let ptr = path.as_ptr() as *const libc::c_char;
+    if let Ok(content) = proc_read_str(ptr, buf) {
         for line in content.lines() {
             let mut parts = line.splitn(2, ':');
             if let (Some(key), Some(val)) = (parts.next(), parts.next()) {
@@ -162,8 +258,10 @@ fn read_meminfo() -> HashMap<String, u64> {
     map
 }
 
-fn read_cpu_times() -> (u64, u64) {
-    if let Ok(content) = fs::read_to_string("/proc/stat") {
+fn read_cpu_times_buf(buf: &mut [u8]) -> (u64, u64) {
+    let path = b"/proc/stat\0";
+    let ptr = path.as_ptr() as *const libc::c_char;
+    if let Ok(content) = proc_read_str(ptr, buf) {
         if let Some(line) = content.lines().find(|l| l.starts_with("cpu ")) {
             let fields: Vec<u64> = line
                 .split_whitespace()
@@ -178,6 +276,12 @@ fn read_cpu_times() -> (u64, u64) {
         }
     }
     (0, 0)
+}
+
+// Tiny buffer just for the one-time startup read
+fn read_meminfo_small() -> HashMap<String, u64> {
+    let mut buf = [0u8; 4096];
+    read_meminfo_buf(&mut buf)
 }
 
 type UserMap = HashMap<u32, String>;
@@ -369,7 +473,7 @@ struct SystemInfo {
 impl App {
     fn new(interval: f64, no_color: bool) -> Self {
         let (w, h) = terminal::size().unwrap_or((80, 24));
-        let meminfo = read_meminfo();
+        let meminfo = read_meminfo_small();
         let mem_total_bytes = *meminfo.get("MemTotal").unwrap_or(&(16 * 1024 * 1024)) * 1024;
         let swap_total_bytes = *meminfo.get("SwapTotal").unwrap_or(&(32 * 1024 * 1024)) * 1024;
         let limit_red_bytes = (mem_total_bytes as f64 * 0.99) as u64;
@@ -832,7 +936,6 @@ impl App {
             let max_offset = chars_count.saturating_sub(40);
             let offset = self.cmd_offset.min(max_offset);
             let displayed_len = p.full_cmd.chars().skip(offset).take(40).count();
-            // Account for the manual padding in format_row
             self.widths[2] = self.widths[2].max(indent_len + displayed_len.max(40));
 
             self.widths[3] = self.widths[3].max(format_memory(p.pss_kb, p.is_thread).len());
@@ -1201,6 +1304,9 @@ struct WorkerState {
     last_procs: HashMap<i32, ProcInfo>,
     last_mem_update: Instant,
     last_use_nano_mode: bool,
+    // reusable buffers for raw I/O
+    path_buf: [u8; 128],    // for build_proc_path
+    file_buf: [u8; PROC_BUF_SIZE],
 }
 
 fn gather_data(
@@ -1221,8 +1327,9 @@ fn gather_data(
             if let Some(pid_str) = entry.file_name().to_str() {
                 if pid_str.chars().all(|c| c.is_ascii_digit()) {
                     if let Ok(pid) = pid_str.parse::<i32>() {
-                        let stat_path = format!("/proc/{}/stat", pid);
-                        let stat_content = match fs::read_to_string(&stat_path) {
+                        // Build /proc/{pid}/stat path and read
+                        let stat_ptr = build_proc_path(pid, "/stat", &mut state.path_buf);
+                        let stat_content = match proc_read_str(stat_ptr, &mut state.file_buf) {
                             Ok(c) => c,
                             Err(_) => continue,
                         };
@@ -1253,9 +1360,11 @@ fn gather_data(
                             }
                         }
 
-                        let status_path = format!("/proc/{}/status", pid);
-                        let status_content =
-                            fs::read_to_string(&status_path).ok().unwrap_or_default();
+                        // Read /proc/{pid}/status (only once) and extract ppid + uid
+                        let status_ptr = build_proc_path(pid, "/status", &mut state.path_buf);
+                        let status_content = proc_read_str(status_ptr, &mut state.file_buf)
+                            .ok()
+                            .unwrap_or("");
 
                         let ppid = status_content
                             .lines()
@@ -1264,6 +1373,15 @@ fn gather_data(
                             .and_then(|s| s.parse::<i32>().ok())
                             .unwrap_or(1);
 
+                        let uid = status_content
+                            .lines()
+                            .find(|l| l.starts_with("Uid:"))
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or(0);
+                        // status_content reference ends here – buffer can now be reused
+
+                        // Nano‑CPU mode (schedstat)
                         let mut use_nano_for_this_proc = use_nano_mode;
                         let mut runtime_ns = 0.0;
 
@@ -1274,16 +1392,16 @@ fn gather_data(
 
                             if let Ok(tasks) = fs::read_dir(&task_dir) {
                                 for task in tasks.flatten() {
-                                    let schedstat_path = format!(
-                                        "{}/{}/schedstat",
-                                        task_dir,
-                                        task.file_name().to_string_lossy()
-                                    );
-                                    if let Ok(content) = fs::read_to_string(&schedstat_path) {
-                                        if let Some(ns_str) = content.split_whitespace().next() {
-                                            if let Ok(ns) = ns_str.parse::<f64>() {
-                                                sum_ns += ns;
-                                                found_any = true;
+                                    if let Some(tid_str) = task.file_name().to_str() {
+                                        if let Ok(tid) = tid_str.parse::<i32>() {
+                                            let sched_ptr = build_task_path(pid, tid, "/schedstat", &mut state.path_buf);
+                                            if let Ok(content) = proc_read_str(sched_ptr, &mut state.file_buf) {
+                                                if let Some(ns_str) = content.split_whitespace().next() {
+                                                    if let Ok(ns) = ns_str.parse::<f64>() {
+                                                        sum_ns += ns;
+                                                        found_any = true;
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1297,10 +1415,11 @@ fn gather_data(
                             }
                         }
 
+                        // Memory (smaps_rollup)
                         let (mut pss_kb, mut uss_kb, mut rss_kb, mut swap_kb) = (0, 0, 0, 0);
                         if do_mem {
-                            let smaps_path = format!("/proc/{}/smaps_rollup", pid);
-                            if let Ok(content) = fs::read_to_string(&smaps_path) {
+                            let smaps_ptr = build_proc_path(pid, "/smaps_rollup", &mut state.path_buf);
+                            if let Ok(content) = proc_read_str(smaps_ptr, &mut state.file_buf) {
                                 let mut private_clean = 0u64;
                                 let mut private_dirty = 0u64;
                                 for line in content.lines() {
@@ -1353,23 +1472,20 @@ fn gather_data(
                             continue;
                         }
 
+                        // User and command line
                         let (user_str, cmd_str, full_cmd_str) = if is_kernel {
                             ("root".to_string(), kthread_name.clone(), kthread_name)
                         } else if let Some(cached) = state.cached_static.get(&pid) {
                             cached.clone()
                         } else {
-                            let uid = status_content
-                                .lines()
-                                .find(|l| l.starts_with("Uid:"))
-                                .and_then(|l| l.split_whitespace().nth(1))
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .unwrap_or(0);
                             let user = user_map
                                 .get(&uid)
                                 .cloned()
                                 .unwrap_or_else(|| uid.to_string());
-                            let full_cmd = fs::read_to_string(format!("/proc/{}/cmdline", pid))
-                                .unwrap_or_default()
+
+                            let cmdline_ptr = build_proc_path(pid, "/cmdline", &mut state.path_buf);
+                            let full_cmd = proc_read_str(cmdline_ptr, &mut state.file_buf)
+                                .unwrap_or("")
                                 .replace('\0', " ")
                                 .trim()
                                 .to_string();
@@ -1422,6 +1538,7 @@ fn gather_data(
                             is_last_child: false,
                         });
 
+                        // Thread enumeration
                         if thread_mode {
                             let task_dir = format!("/proc/{}/task", pid);
                             if let Ok(tasks) = fs::read_dir(&task_dir) {
@@ -1431,28 +1548,17 @@ fn gather_data(
                                             if tid == pid {
                                                 continue;
                                             }
-                                            let thread_sched =
-                                                format!("{}/{}/schedstat", task_dir, tid);
+                                            let sched_ptr = build_task_path(pid, tid, "/schedstat", &mut state.path_buf);
                                             let mut t_cpu = 0.0;
-
-                                            if let Ok(content) = fs::read_to_string(&thread_sched) {
-                                                if let Some(ns_str) =
-                                                    content.split_whitespace().next()
-                                                {
+                                            if let Ok(content) = proc_read_str(sched_ptr, &mut state.file_buf) {
+                                                if let Some(ns_str) = content.split_whitespace().next() {
                                                     if let Ok(ns) = ns_str.parse::<f64>() {
-                                                        let prev =
-                                                            state.prev_cpu_times.get(&tid).copied();
+                                                        let prev = state.prev_cpu_times.get(&tid).copied();
                                                         if let Some((prev_val, prev_time)) = prev {
-                                                            let dt = now
-                                                                .duration_since(prev_time)
-                                                                .as_secs_f64();
+                                                            let dt = now.duration_since(prev_time).as_secs_f64();
                                                             let delta = ns - prev_val;
                                                             if dt > 0.0 && delta >= 0.0 {
-                                                                t_cpu = (delta
-                                                                    / 1_000_000_000.0
-                                                                    / dt
-                                                                    / num_cpus as f64)
-                                                                    * 100.0;
+                                                                t_cpu = (delta / 1_000_000_000.0 / dt / num_cpus as f64) * 100.0;
                                                             }
                                                         }
                                                         state.prev_cpu_times.insert(tid, (ns, now));
@@ -1465,10 +1571,7 @@ fn gather_data(
                                                 ppid: pid,
                                                 user: user_str.clone(),
                                                 cmd: cmd_str.clone(),
-                                                full_cmd: format!(
-                                                    "[thread {}] {}",
-                                                    tid, full_cmd_str
-                                                ),
+                                                full_cmd: format!("[thread {}] {}", tid, full_cmd_str),
                                                 pss_kb: 0,
                                                 uss_kb: 0,
                                                 rss_kb: 0,
@@ -1492,18 +1595,8 @@ fn gather_data(
         }
     }
 
-    let active_pids: HashSet<i32> = procs
-        .iter()
-        .map(|p| if p.is_thread { p.tid } else { p.pid })
-        .collect();
-    state
-        .prev_cpu_times
-        .retain(|id, _| active_pids.contains(id) || state.cached_static.contains_key(id));
-    state
-        .cached_static
-        .retain(|pid, _| active_pids.contains(pid));
-
-    let (total, idle) = read_cpu_times();
+    // System‑wide info
+    let (total, idle) = read_cpu_times_buf(&mut state.file_buf);
     let cpu_percent = if let Some((prev_total, prev_idle)) = state.prev_sys_cpu {
         let d_total = total.saturating_sub(prev_total);
         let d_idle = idle.saturating_sub(prev_idle);
@@ -1517,7 +1610,7 @@ fn gather_data(
     };
     state.prev_sys_cpu = Some((total, idle));
 
-    let meminfo = read_meminfo();
+    let meminfo = read_meminfo_buf(&mut state.file_buf);
     let mem_total = *meminfo.get("MemTotal").unwrap_or(&0);
     let mem_avail = *meminfo.get("MemAvailable").unwrap_or(&{
         meminfo.get("MemFree").unwrap_or(&0)
@@ -1540,26 +1633,34 @@ fn gather_data(
         0.0
     };
 
-    let load = fs::read_to_string("/proc/loadavg")
-        .ok()
-        .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
-        .unwrap_or_default();
-    let uptime = fs::read_to_string("/proc/uptime")
-        .ok()
-        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
-        .map(|s| {
-            let s = s as u64;
-            let y = s / (365 * 86400);
-            let r = s % (365 * 86400);
-            let d = r / 86400;
-            let r = r % 86400;
-            let h = r / 3600;
-            let r = r % 3600;
-            let m = r / 60;
-            let sec = r % 60;
-            format!("{}y {}d {}h {}m {}s", y, d, h, m, sec)
-        })
-        .unwrap_or_default();
+    let load = {
+        let path = b"/proc/loadavg\0";
+        let ptr = path.as_ptr() as *const libc::c_char;
+        proc_read_str(ptr, &mut state.file_buf)
+            .ok()
+            .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
+    };
+    let uptime = {
+        let path = b"/proc/uptime\0";
+        let ptr = path.as_ptr() as *const libc::c_char;
+        proc_read_str(ptr, &mut state.file_buf)
+            .ok()
+            .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+            .map(|s| {
+                let s = s as u64;
+                let y = s / (365 * 86400);
+                let r = s % (365 * 86400);
+                let d = r / 86400;
+                let r = r % 86400;
+                let h = r / 3600;
+                let r = r % 3600;
+                let m = r / 60;
+                let sec = r % 60;
+                format!("{}y {}d {}h {}m {}s", y, d, h, m, sec)
+            })
+            .unwrap_or_default()
+    };
 
     let (mut run, mut slp, mut zom) = (0, 0, 0);
     for p in &procs {
@@ -1607,6 +1708,8 @@ fn worker_loop(
         last_procs: HashMap::new(),
         last_mem_update: Instant::now() - Duration::from_secs(10),
         last_use_nano_mode: false,
+        path_buf: [0u8; 128],
+        file_buf: [0u8; PROC_BUF_SIZE],
     };
 
     let priming_int = f64::from_bits(interval_shared.load(Ordering::Relaxed));
