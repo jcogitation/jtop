@@ -16,7 +16,64 @@ use std::{
     time::{Duration, Instant},
 };
 
-// ─ Terminal Guard: guarantees cleanup on exit, panic, or signal ──────
+// ── Tier 1 Optimization #1: Raw procfs reader ───────────────────────
+//
+// Replaces Rust's fs::read_to_string() which on procfs:
+//   - calls fstat()/statx() first (wasted — procfs reports st_size=0)
+//   - starts with a tiny buffer and grows via multiple read() syscalls
+//   - heap-allocates a String and validates UTF-8
+//
+// This version: exactly 3 syscalls (open + read + close), stack buffer,
+// zero heap allocation, zero UTF-8 validation (procfs is always ASCII/UTF-8).
+
+/// Stack buffer size for procfs reads. 8 KB covers all common files
+/// (stat ~200B, status ~1-2KB, meminfo ~1.5KB, smaps_rollup ~500B, cmdline up to 8KB).
+const PROC_BUF_SIZE: usize = 8192;
+
+/// Read a procfs file into a stack buffer using raw syscalls.
+/// Returns a `&str` view into `buf` on success, `None` on any failure.
+///
+/// # Safety
+/// Caller must ensure `path` is a valid filesystem path. The returned `&str`
+/// uses `from_utf8_unchecked`, which is sound because procfs contents are
+/// guaranteed to be ASCII/UTF-8 by the kernel.
+#[inline]
+unsafe fn proc_read<'a>(path: &str, buf: &'a mut [u8]) -> Option<&'a str> {
+    // Build null-terminated path on stack (procfs paths are short, <128 bytes)
+    let path_bytes = path.as_bytes();
+    let mut c_path = [0u8; 128];
+    if path_bytes.len() >= c_path.len() {
+        return None;
+    }
+    std::ptr::copy_nonoverlapping(path_bytes.as_ptr(), c_path.as_mut_ptr(), path_bytes.len());
+
+    let fd = libc::open(c_path.as_ptr() as *const libc::c_char, libc::O_RDONLY);
+    if fd < 0 {
+        return None;
+    }
+
+    let mut total = 0usize;
+    loop {
+        if total >= buf.len() {
+            break;
+        }
+        let n = libc::read(
+            fd,
+            buf.as_mut_ptr().add(total) as *mut libc::c_void,
+            buf.len() - total,
+        );
+        if n <= 0 {
+            break; // 0 = EOF, <0 = error
+        }
+        total += n as usize;
+    }
+    libc::close(fd);
+
+    // procfs contents are ASCII/UTF-8; skip validation
+    Some(std::str::from_utf8_unchecked(&buf[..total]))
+}
+
+// ── Terminal Guard: guarantees cleanup on exit, panic, or signal ──────
 struct TerminalGuard {
     raw_enabled: bool,
     alt_screen_enabled: bool,
@@ -144,12 +201,13 @@ fn visible_len(s: &str) -> usize {
 // ── Direct /proc parsers ──────────────────────────────────────────────
 fn read_meminfo() -> HashMap<String, u64> {
     let mut map = HashMap::new();
-    if let Ok(content) = fs::read_to_string("/proc/meminfo") {
+    let mut buf = [0u8; PROC_BUF_SIZE];
+    let content = unsafe { proc_read("/proc/meminfo", &mut buf) };
+    if let Some(content) = content {
         for line in content.lines() {
             let mut parts = line.splitn(2, ':');
             if let (Some(key), Some(val)) = (parts.next(), parts.next()) {
                 if let Some(num) = val
-                    .trim()
                     .split_whitespace()
                     .next()
                     .and_then(|s| s.parse().ok())
@@ -163,7 +221,9 @@ fn read_meminfo() -> HashMap<String, u64> {
 }
 
 fn read_cpu_times() -> (u64, u64) {
-    if let Ok(content) = fs::read_to_string("/proc/stat") {
+    let mut buf = [0u8; PROC_BUF_SIZE];
+    let content = unsafe { proc_read("/proc/stat", &mut buf) };
+    if let Some(content) = content {
         if let Some(line) = content.lines().find(|l| l.starts_with("cpu ")) {
             let fields: Vec<u64> = line
                 .split_whitespace()
@@ -227,7 +287,7 @@ fn color_pss(size_bytes: u64, limit_red_bytes: u64) -> (u8, u8, u8) {
     let red = (255, 0, 0);
     let limit_yellow_pale = 64 * 1024u64.pow(2);
     let limit_yellow_full = 512 * 1024u64.pow(2);
-    if size_bytes <= 0 {
+    if size_bytes == 0 {
         return green;
     }
     if size_bytes >= limit_red_bytes {
@@ -300,7 +360,7 @@ fn color_rss(size_bytes: u64, mem_total_bytes: u64) -> (u8, u8, u8) {
 fn color_swap(size_bytes: u64, swap_total_bytes: u64) -> (u8, u8, u8) {
     let red = (255, 0, 0);
     let pink = (255, 128, 128);
-    let limit_pink = 1 * 1024u64.pow(3);
+    let limit_pink = 1024u64.pow(3);
     if size_bytes >= swap_total_bytes {
         return red;
     }
@@ -562,6 +622,7 @@ impl App {
             let all_threads: Vec<&ProcInfo> =
                 self.raw_data.iter().filter(|p| p.is_thread).collect();
 
+            #[allow(clippy::too_many_arguments)]
             fn dfs(
                 pid: i32,
                 depth: u8,
@@ -739,49 +800,41 @@ impl App {
             pss.clone()
         } else if p.is_kernel {
             color_text_rgb(GRAY_KERNEL.0, GRAY_KERNEL.1, GRAY_KERNEL.2, &pss)
+        } else if p.is_thread {
+            color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &pss)
         } else {
-            if p.is_thread {
-                color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &pss)
-            } else {
-                let (r, g, b) = color_pss(p.pss_kb * 1024, self.limit_red_bytes);
-                color_text_rgb(r, g, b, &pss)
-            }
+            let (r, g, b) = color_pss(p.pss_kb * 1024, self.limit_red_bytes);
+            color_text_rgb(r, g, b, &pss)
         };
         let uss_cell = if self.no_color {
             uss.clone()
         } else if p.is_kernel {
             color_text_rgb(GRAY_KERNEL.0, GRAY_KERNEL.1, GRAY_KERNEL.2, &uss)
+        } else if p.is_thread {
+            color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &uss)
         } else {
-            if p.is_thread {
-                color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &uss)
-            } else {
-                let (r, g, b) = color_pss(p.uss_kb * 1024, self.limit_red_bytes);
-                color_text_rgb(r, g, b, &uss)
-            }
+            let (r, g, b) = color_pss(p.uss_kb * 1024, self.limit_red_bytes);
+            color_text_rgb(r, g, b, &uss)
         };
         let rss_cell = if self.no_color {
             rss.clone()
         } else if p.is_kernel {
             color_text_rgb(GRAY_KERNEL.0, GRAY_KERNEL.1, GRAY_KERNEL.2, &rss)
+        } else if p.is_thread {
+            color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &rss)
         } else {
-            if p.is_thread {
-                color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &rss)
-            } else {
-                let (r, g, b) = color_rss(p.rss_kb * 1024, self.mem_total_bytes);
-                color_text_rgb(r, g, b, &rss)
-            }
+            let (r, g, b) = color_rss(p.rss_kb * 1024, self.mem_total_bytes);
+            color_text_rgb(r, g, b, &rss)
         };
         let swap_cell = if self.no_color {
             swap.clone()
         } else if p.is_kernel {
             color_text_rgb(GRAY_KERNEL.0, GRAY_KERNEL.1, GRAY_KERNEL.2, &swap)
+        } else if p.is_thread {
+            color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &swap)
         } else {
-            if p.is_thread {
-                color_text_rgb(GRAY_THREAD.0, GRAY_THREAD.1, GRAY_THREAD.2, &swap)
-            } else {
-                let (r, g, b) = color_swap(p.swap_kb * 1024, self.swap_total_bytes);
-                color_text_rgb(r, g, b, &swap)
-            }
+            let (r, g, b) = color_swap(p.swap_kb * 1024, self.swap_total_bytes);
+            color_text_rgb(r, g, b, &swap)
         };
         let cpu_cell = if self.no_color {
             cpu.clone()
@@ -832,7 +885,6 @@ impl App {
             let max_offset = chars_count.saturating_sub(40);
             let offset = self.cmd_offset.min(max_offset);
             let displayed_len = p.full_cmd.chars().skip(offset).take(40).count();
-            // Account for the manual padding in format_row
             self.widths[2] = self.widths[2].max(indent_len + displayed_len.max(40));
 
             self.widths[3] = self.widths[3].max(format_memory(p.pss_kb, p.is_thread).len());
@@ -975,7 +1027,7 @@ impl App {
     fn render(&mut self) -> io::Result<()> {
         let total = self.filtered_raw.len();
         let visible = self.term_height.saturating_sub(3);
-        let max_scroll = if total > visible { total - visible } else { 0 };
+        let max_scroll = total.saturating_sub(visible);
         self.scroll_pos = self.scroll_pos.min(max_scroll);
 
         let sys = self.build_system_line();
@@ -1149,7 +1201,7 @@ impl App {
             left
         };
 
-        let status = if left.len() + tot_text.len() + 1 <= self.term_width {
+        let status = if left.len() + tot_text.len() + 1 < self.term_width {
             format!(
                 "{}{}{}",
                 left,
@@ -1178,11 +1230,12 @@ impl App {
             format!("{: <width$}", status, width = self.term_width)
         } else {
             format!(
-                "{}{}{}{}",
+                "{}{}{: <width$}{}",
                 status_bg,
                 ansi_fg_rgb(255, 255, 255),
-                format!("{: <width$}", status, width = self.term_width),
-                rst
+                status,
+                rst,
+                width = self.term_width
             )
         };
 
@@ -1203,6 +1256,7 @@ struct WorkerState {
     last_use_nano_mode: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gather_data(
     do_mem: bool,
     use_nano_mode: bool,
@@ -1221,41 +1275,53 @@ fn gather_data(
             if let Some(pid_str) = entry.file_name().to_str() {
                 if pid_str.chars().all(|c| c.is_ascii_digit()) {
                     if let Ok(pid) = pid_str.parse::<i32>() {
+                        // ── Read /proc/{pid}/stat (parse immediately, reuse buffer) ──
                         let stat_path = format!("/proc/{}/stat", pid);
-                        let stat_content = match fs::read_to_string(&stat_path) {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        };
-
-                        let (state_char, utime, stime) =
-                            if let Some(rbracket) = stat_content.rfind(')') {
-                                let fields: Vec<&str> =
-                                    stat_content[rbracket + 2..].split_whitespace().collect();
-                                if fields.len() >= 13 {
-                                    (
-                                        fields[0].chars().next().unwrap_or('?'),
-                                        fields[11].parse::<u64>().unwrap_or(0),
-                                        fields[12].parse::<u64>().unwrap_or(0),
-                                    )
+                        let mut stat_buf = [0u8; PROC_BUF_SIZE];
+                        let (state_char, utime, stime, kthread_name) = {
+                            let stat_content = match unsafe {
+                                proc_read(&stat_path, &mut stat_buf)
+                            } {
+                                Some(c) => c,
+                                None => continue,
+                            };
+                            let (state_char, utime, stime) =
+                                if let Some(rbracket) = stat_content.rfind(')') {
+                                    let fields: Vec<&str> =
+                                        stat_content[rbracket + 2..].split_whitespace().collect();
+                                    if fields.len() >= 13 {
+                                        (
+                                            fields[0].chars().next().unwrap_or('?'),
+                                            fields[11].parse::<u64>().unwrap_or(0),
+                                            fields[12].parse::<u64>().unwrap_or(0),
+                                        )
+                                    } else {
+                                        continue;
+                                    }
                                 } else {
                                     continue;
+                                };
+                            let kthread_name = if let (Some(open), Some(close)) =
+                                (stat_content.find('('), stat_content.rfind(')'))
+                            {
+                                if close > open {
+                                    stat_content[open + 1..close].to_string()
+                                } else {
+                                    String::new()
                                 }
                             } else {
-                                continue;
+                                String::new()
                             };
+                            (state_char, utime, stime, kthread_name)
+                        };
+                        // stat_buf is now free to reuse
 
-                        let mut kthread_name = String::new();
-                        if let (Some(open), Some(close)) =
-                            (stat_content.find('('), stat_content.rfind(')'))
-                        {
-                            if close > open {
-                                kthread_name = stat_content[open + 1..close].to_string();
-                            }
-                        }
-
+                        // ── Read /proc/{pid}/status (kept alive for UID extraction) ──
                         let status_path = format!("/proc/{}/status", pid);
-                        let status_content =
-                            fs::read_to_string(&status_path).ok().unwrap_or_default();
+                        let mut status_buf = [0u8; PROC_BUF_SIZE];
+                        let status_content = unsafe {
+                            proc_read(&status_path, &mut status_buf).unwrap_or("")
+                        };
 
                         let ppid = status_content
                             .lines()
@@ -1264,6 +1330,7 @@ fn gather_data(
                             .and_then(|s| s.parse::<i32>().ok())
                             .unwrap_or(1);
 
+                        // ── Nanosecond CPU: read /proc/{pid}/task/*/schedstat ──
                         let mut use_nano_for_this_proc = use_nano_mode;
                         let mut runtime_ns = 0.0;
 
@@ -1271,6 +1338,7 @@ fn gather_data(
                             let task_dir = format!("/proc/{}/task", pid);
                             let mut sum_ns = 0.0;
                             let mut found_any = false;
+                            let mut sched_buf = [0u8; 256];
 
                             if let Ok(tasks) = fs::read_dir(&task_dir) {
                                 for task in tasks.flatten() {
@@ -1279,7 +1347,9 @@ fn gather_data(
                                         task_dir,
                                         task.file_name().to_string_lossy()
                                     );
-                                    if let Ok(content) = fs::read_to_string(&schedstat_path) {
+                                    if let Some(content) = unsafe {
+                                        proc_read(&schedstat_path, &mut sched_buf)
+                                    } {
                                         if let Some(ns_str) = content.split_whitespace().next() {
                                             if let Ok(ns) = ns_str.parse::<f64>() {
                                                 sum_ns += ns;
@@ -1297,10 +1367,14 @@ fn gather_data(
                             }
                         }
 
+                        // ── Read /proc/{pid}/smaps_rollup (when memory updates needed) ──
                         let (mut pss_kb, mut uss_kb, mut rss_kb, mut swap_kb) = (0, 0, 0, 0);
                         if do_mem {
                             let smaps_path = format!("/proc/{}/smaps_rollup", pid);
-                            if let Ok(content) = fs::read_to_string(&smaps_path) {
+                            let mut smaps_buf = [0u8; PROC_BUF_SIZE];
+                            if let Some(content) = unsafe {
+                                proc_read(&smaps_path, &mut smaps_buf)
+                            } {
                                 let mut private_clean = 0u64;
                                 let mut private_dirty = 0u64;
                                 for line in content.lines() {
@@ -1353,6 +1427,7 @@ fn gather_data(
                             continue;
                         }
 
+                        // ── Read UID from status + cmdline (kernel procs skip cmdline) ──
                         let (user_str, cmd_str, full_cmd_str) = if is_kernel {
                             ("root".to_string(), kthread_name.clone(), kthread_name)
                         } else if let Some(cached) = state.cached_static.get(&pid) {
@@ -1368,11 +1443,16 @@ fn gather_data(
                                 .get(&uid)
                                 .cloned()
                                 .unwrap_or_else(|| uid.to_string());
-                            let full_cmd = fs::read_to_string(format!("/proc/{}/cmdline", pid))
-                                .unwrap_or_default()
-                                .replace('\0', " ")
-                                .trim()
-                                .to_string();
+
+                            let cmdline_path = format!("/proc/{}/cmdline", pid);
+                            let mut cmdline_buf = [0u8; PROC_BUF_SIZE];
+                            let full_cmd = if let Some(c) = unsafe {
+                                proc_read(&cmdline_path, &mut cmdline_buf)
+                            } {
+                                c.replace('\0', " ").trim().to_string()
+                            } else {
+                                String::new()
+                            };
                             let full_cmd = full_cmd.chars().take(2040).collect::<String>();
                             let cmd = full_cmd.chars().take(40).collect::<String>();
                             let res = (user, cmd, full_cmd);
@@ -1434,8 +1514,11 @@ fn gather_data(
                                             let thread_sched =
                                                 format!("{}/{}/schedstat", task_dir, tid);
                                             let mut t_cpu = 0.0;
+                                            let mut sched_buf = [0u8; 256];
 
-                                            if let Ok(content) = fs::read_to_string(&thread_sched) {
+                                            if let Some(content) = unsafe {
+                                                proc_read(&thread_sched, &mut sched_buf)
+                                            } {
                                                 if let Some(ns_str) =
                                                     content.split_whitespace().next()
                                                 {
@@ -1540,12 +1623,12 @@ fn gather_data(
         0.0
     };
 
-    let load = fs::read_to_string("/proc/loadavg")
-        .ok()
+    let mut small_buf = [0u8; 256];
+    let load = unsafe { proc_read("/proc/loadavg", &mut small_buf) }
         .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
         .unwrap_or_default();
-    let uptime = fs::read_to_string("/proc/uptime")
-        .ok()
+
+    let uptime = unsafe { proc_read("/proc/uptime", &mut small_buf) }
         .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
         .map(|s| {
             let s = s as u64;
@@ -1590,6 +1673,7 @@ fn gather_data(
     (procs, sys_info)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     tx: mpsc::Sender<(Vec<ProcInfo>, SystemInfo)>,
     interval_shared: Arc<AtomicU64>,
@@ -1932,11 +2016,7 @@ fn main() -> io::Result<()> {
                     }
                     KeyCode::Down => {
                         let vis = app.term_height.saturating_sub(3);
-                        let max = if app.filtered_raw.len() > vis {
-                            app.filtered_raw.len() - vis
-                        } else {
-                            0
-                        };
+                        let max = app.filtered_raw.len().saturating_sub(vis);
                         app.scroll_pos = (app.scroll_pos + 5).min(max);
                         ui_dirty = true;
                     }
@@ -2025,11 +2105,7 @@ fn main() -> io::Result<()> {
             }
 
             let vis = app.term_height.saturating_sub(3);
-            let max = if app.filtered_raw.len() > vis {
-                app.filtered_raw.len() - vis
-            } else {
-                0
-            };
+            let max = app.filtered_raw.len().saturating_sub(vis);
             app.scroll_pos = app.scroll_pos.min(max);
             if app.searching {
                 app.scroll_pos = 0;
